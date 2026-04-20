@@ -10,11 +10,32 @@ from sandbox.network import Mount, Network
 from sandbox.process import Process
 
 
+class VsockStream:
+    def __init__(self, reader, writer):
+        self._reader = reader
+        self._writer = writer
+
+    async def read(self, n: int) -> bytes:
+        return await self._reader.read(n)
+
+    async def write(self, data: bytes) -> None:
+        self._writer.write(data)
+        await self._writer.drain()
+
+    async def close(self) -> None:
+        self._writer.close()
+
+    async def __aenter__(self) -> VsockStream:
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.close()
+
+
 class Sandbox:
     def __init__(self, rpc: RpcConn, process: asyncio.subprocess.Process):
         self._rpc = rpc
         self._process = process
-        self._notifications = rpc._notifications
         self._network = Network(_rpc=rpc)
 
     @classmethod
@@ -35,17 +56,16 @@ class Sandbox:
         )
 
         reader = proc.stdout
-        writer_transport = proc.stdin
 
         class WriterAdapter:
             def write(self, data):
-                writer_transport.write(data)
+                proc.stdin.write(data)
 
             async def drain(self):
-                await writer_transport.drain()
+                await proc.stdin.drain()
 
             def close(self):
-                writer_transport.close()
+                proc.stdin.close()
 
         rpc = RpcConn(reader, WriterAdapter())
         rpc.start()
@@ -94,7 +114,7 @@ class Sandbox:
             params["timeout"] = timeout
 
         result = await self._rpc.call("exec.start", params)
-        return Process(result["pid"], self._rpc, self._notifications)
+        return Process(result["pid"], self._rpc)
 
     async def environment(
         self,
@@ -121,8 +141,54 @@ class Sandbox:
             params["mem_limit"] = mem_limit
 
         await self._rpc.call("env.create", params)
-        return Environment(name, self._rpc, self._notifications)
+        return Environment(name, self._rpc)
 
     @property
     def network(self) -> Network:
         return self._network
+
+    async def vsock_connect(self, port: int) -> VsockStream:
+        result = await self._rpc.call("vsock.connect", {"port": port})
+        stream_id = result["stream_id"]
+        return VsockStream(
+            VsockReadAdapter(self._rpc, stream_id),
+            VsockWriteAdapter(self._rpc, stream_id),
+        )
+
+
+class VsockReadAdapter:
+    def __init__(self, rpc, stream_id):
+        self._rpc = rpc
+        self._stream_id = stream_id
+        self._buffer = asyncio.Queue()
+        rpc.on_notification("vsock.data", self._on_data)
+
+    def _on_data(self, msg):
+        params = msg.get("params", {})
+        if params.get("stream_id") == self._stream_id:
+            import base64
+            self._buffer.put_nowait(base64.b64decode(params["data_b64"]))
+
+    async def read(self, n: int) -> bytes:
+        return await self._buffer.get()
+
+
+class VsockWriteAdapter:
+    def __init__(self, rpc, stream_id):
+        self._rpc = rpc
+        self._stream_id = stream_id
+
+    def write(self, data):
+        import base64
+        asyncio.create_task(self._rpc.call("vsock.write", {
+            "stream_id": self._stream_id,
+            "data_b64": base64.b64encode(data).decode(),
+        }))
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        asyncio.create_task(self._rpc.call("vsock.close", {
+            "stream_id": self._stream_id,
+        }))

@@ -6,14 +6,12 @@ from sandbox.process import Process
 
 if TYPE_CHECKING:
     from sandbox._rpc import RpcConn
-    from sandbox.network import Mount
 
 
 class Environment:
-    def __init__(self, name: str, rpc: RpcConn, notifications):
+    def __init__(self, name: str, rpc: RpcConn):
         self.name = name
         self._rpc = rpc
-        self._notifications = notifications
 
     async def exec(
         self,
@@ -34,7 +32,7 @@ class Environment:
             params["timeout"] = timeout
 
         result = await self._rpc.call("exec.start", params)
-        proc = Process(result["pid"], self._rpc, self._notifications)
+        proc = Process(result["pid"], self._rpc)
 
         if stdin is not None:
             if isinstance(stdin, bytes):

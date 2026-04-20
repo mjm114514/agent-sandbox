@@ -1,34 +1,50 @@
 import asyncio
 import json
 import struct
-from typing import Any
+from typing import Any, Callable
 
 
 class RpcConn:
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    def __init__(self, reader, writer):
         self._reader = reader
         self._writer = writer
         self._next_id = 0
         self._pending: dict[int, asyncio.Future] = {}
-        self._notifications: asyncio.Queue = asyncio.Queue()
+        self._notification_handlers: dict[str, list[Callable]] = {}
         self._read_task: asyncio.Task | None = None
 
     def start(self):
         self._read_task = asyncio.create_task(self._read_loop())
 
-    async def _read_loop(self):
-        while True:
-            header = await self._reader.readexactly(4)
-            length = struct.unpack(">I", header)[0]
-            body = await self._reader.readexactly(length)
-            msg = json.loads(body)
+    def on_notification(self, method: str, handler: Callable):
+        self._notification_handlers.setdefault(method, []).append(handler)
 
-            if "id" in msg and "method" not in msg:
-                fut = self._pending.pop(msg["id"], None)
-                if fut and not fut.done():
-                    fut.set_result(msg)
-            elif "method" in msg and "id" not in msg:
-                await self._notifications.put(msg)
+    def off_notification(self, method: str, handler: Callable):
+        handlers = self._notification_handlers.get(method, [])
+        if handler in handlers:
+            handlers.remove(handler)
+
+    async def _read_loop(self):
+        try:
+            while True:
+                header = await self._reader.readexactly(4)
+                length = struct.unpack(">I", header)[0]
+                body = await self._reader.readexactly(length)
+                msg = json.loads(body)
+
+                if "id" in msg and "method" not in msg:
+                    fut = self._pending.pop(msg["id"], None)
+                    if fut and not fut.done():
+                        fut.set_result(msg)
+                elif "method" in msg and "id" not in msg:
+                    method = msg["method"]
+                    for handler in self._notification_handlers.get(method, []):
+                        try:
+                            handler(msg)
+                        except Exception:
+                            pass
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
 
     async def call(self, method: str, params: Any = None) -> Any:
         self._next_id += 1

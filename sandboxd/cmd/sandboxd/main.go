@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -16,11 +17,13 @@ import (
 )
 
 type daemon struct {
-	backend   vm.Backend
-	currentVM vm.VM
-	agentConn *rpc.Conn
-	sdk       *rpc.StdioServer
-	netSvc    *netstack.Service
+	backend      vm.Backend
+	currentVM    vm.VM
+	agentConn    *rpc.Conn
+	sdk          *rpc.StdioServer
+	netSvc       *netstack.Service
+	vsockStreams map[int]net.Conn
+	nextStreamID int
 }
 
 func main() {
@@ -28,7 +31,9 @@ func main() {
 	log.SetOutput(os.Stderr)
 	log.Println("sandboxd starting")
 
-	d := &daemon{}
+	d := &daemon{
+		vsockStreams: make(map[int]net.Conn),
+	}
 	d.detectBackend()
 
 	sdkServer := rpc.NewStdioServer(os.Stdin, os.Stdout, nil)
@@ -62,15 +67,23 @@ func (d *daemon) handleSDKCall(method string, params json.RawMessage) (any, erro
 		return d.sandboxStop()
 	case "sandbox.destroy":
 		return d.sandboxDestroy()
+	case "env.create":
+		return d.envCreate(params)
+	case "vsock.connect":
+		return d.vsockConnect(params)
+	case "vsock.write":
+		return d.vsockWrite(params)
+	case "vsock.close":
+		return d.vsockClose(params)
 	default:
 		if d.agentConn == nil {
 			return nil, &rpc.Error{Code: -32601, Message: "vm-agent not connected"}
 		}
-		result, err := d.agentConn.Call(method, params)
+		result, err := d.agentConn.Call(method, json.RawMessage(params))
 		if err != nil {
 			return nil, err
 		}
-		return result, nil
+		return json.RawMessage(*result), nil
 	}
 }
 
@@ -231,4 +244,173 @@ func (d *daemon) sandboxDestroy() (any, error) {
 	d.currentVM = nil
 	d.agentConn = nil
 	return map[string]any{"ok": true}, nil
+}
+
+type envCreateParams struct {
+	Name     string `json:"name"`
+	Cwd      string `json:"cwd"`
+	CPULimit string `json:"cpu_limit,omitempty"`
+	MemLimit string `json:"mem_limit,omitempty"`
+	Mounts   []struct {
+		HostPath  string `json:"host_path"`
+		GuestPath string `json:"guest_path"`
+		Mode      string `json:"mode"`
+	} `json:"mounts,omitempty"`
+	Env map[string]string `json:"env,omitempty"`
+}
+
+func (d *daemon) envCreate(params json.RawMessage) (any, error) {
+	var p envCreateParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, fmt.Errorf("parse params: %w", err)
+	}
+
+	if d.agentConn == nil {
+		return nil, fmt.Errorf("vm-agent not connected")
+	}
+
+	// Provision mounts: share host dirs into VM, then tell vm-agent to bind them
+	var agentMounts []map[string]string
+	for i, m := range p.Mounts {
+		tag := fmt.Sprintf("env-%s-mount-%d", p.Name, i)
+		if err := d.currentVM.ShareDir(tag, m.HostPath); err != nil {
+			return nil, fmt.Errorf("share dir %s: %w", m.HostPath, err)
+		}
+		// Tell vm-agent to mount the virtiofs share
+		_, err := d.agentConn.Call("mount.bind", map[string]string{
+			"virtiofs_tag": tag,
+			"guest_path":   m.GuestPath,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("mount.bind %s: %w", m.GuestPath, err)
+		}
+		agentMounts = append(agentMounts, map[string]string{
+			"virtiofs_tag": tag,
+			"guest_path":   m.GuestPath,
+			"mode":         m.Mode,
+		})
+	}
+
+	// Create the environment on vm-agent
+	agentParams := map[string]any{
+		"name": p.Name,
+		"cwd":  p.Cwd,
+	}
+	if p.CPULimit != "" {
+		agentParams["cpu_limit"] = p.CPULimit
+	}
+	if p.MemLimit != "" {
+		agentParams["mem_limit"] = p.MemLimit
+	}
+	if len(agentMounts) > 0 {
+		agentParams["mounts"] = agentMounts
+	}
+	if p.Env != nil {
+		agentParams["env"] = p.Env
+	}
+
+	result, err := d.agentConn.Call("env.create", agentParams)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(*result), nil
+}
+
+func (d *daemon) vsockConnect(params json.RawMessage) (any, error) {
+	var p struct {
+		Port int `json:"port"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, err
+	}
+	if d.currentVM == nil {
+		return nil, fmt.Errorf("no VM running")
+	}
+
+	listener, err := d.currentVM.VSockListen(uint32(p.Port))
+	if err != nil {
+		return nil, fmt.Errorf("vsock listen port %d: %w", p.Port, err)
+	}
+
+	conn, err := listener.Accept()
+	listener.Close()
+	if err != nil {
+		return nil, fmt.Errorf("vsock accept port %d: %w", p.Port, err)
+	}
+
+	d.nextStreamID++
+	streamID := d.nextStreamID
+	d.vsockStreams[streamID] = conn
+
+	go d.vsockReadLoop(streamID, conn)
+
+	return map[string]any{"stream_id": streamID}, nil
+}
+
+func (d *daemon) vsockReadLoop(streamID int, conn net.Conn) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := conn.Read(buf)
+		if n > 0 {
+			d.sdk.ForwardNotification(&rpc.Message{
+				Method: "vsock.data",
+				Params: mustMarshal(map[string]any{
+					"stream_id": streamID,
+					"data_b64":  base64.StdEncoding.EncodeToString(buf[:n]),
+				}),
+			})
+		}
+		if err != nil {
+			d.sdk.ForwardNotification(&rpc.Message{
+				Method: "vsock.closed",
+				Params: mustMarshal(map[string]any{"stream_id": streamID}),
+			})
+			delete(d.vsockStreams, streamID)
+			return
+		}
+	}
+}
+
+func (d *daemon) vsockWrite(params json.RawMessage) (any, error) {
+	var p struct {
+		StreamID int    `json:"stream_id"`
+		DataB64  string `json:"data_b64"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, err
+	}
+	conn, ok := d.vsockStreams[p.StreamID]
+	if !ok {
+		return nil, fmt.Errorf("stream %d not found", p.StreamID)
+	}
+	data, err := base64.StdEncoding.DecodeString(p.DataB64)
+	if err != nil {
+		return nil, err
+	}
+	_, err = conn.Write(data)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true}, nil
+}
+
+func (d *daemon) vsockClose(params json.RawMessage) (any, error) {
+	var p struct {
+		StreamID int `json:"stream_id"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, err
+	}
+	conn, ok := d.vsockStreams[p.StreamID]
+	if !ok {
+		return nil, fmt.Errorf("stream %d not found", p.StreamID)
+	}
+	conn.Close()
+	delete(d.vsockStreams, p.StreamID)
+	return map[string]any{"ok": true}, nil
+}
+
+func mustMarshal(v any) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
 }
