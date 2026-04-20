@@ -46,7 +46,7 @@ class RpcConn:
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
 
-    async def call(self, method: str, params: Any = None) -> Any:
+    async def call(self, method: str, params: Any = None, timeout: float = 30.0) -> Any:
         self._next_id += 1
         msg_id = self._next_id
 
@@ -61,7 +61,11 @@ class RpcConn:
         self._writer.write(struct.pack(">I", len(body)) + body)
         await self._writer.drain()
 
-        resp = await fut
+        try:
+            resp = await asyncio.wait_for(fut, timeout)
+        except asyncio.TimeoutError:
+            self._pending.pop(msg_id, None)
+            raise RpcTimeoutError(method, timeout)
         if "error" in resp:
             raise RpcError(resp["error"]["code"], resp["error"]["message"])
         return resp.get("result")
@@ -77,3 +81,10 @@ class RpcError(Exception):
         self.code = code
         self.message = message
         super().__init__(f"RPC error {code}: {message}")
+
+
+class RpcTimeoutError(Exception):
+    def __init__(self, method: str, timeout: float):
+        self.method = method
+        self.timeout = timeout
+        super().__init__(f"RPC call {method} timed out after {timeout}s")

@@ -37,6 +37,39 @@ class Sandbox:
         self._rpc = rpc
         self._process = process
         self._network = Network(_rpc=rpc)
+        self._status = "created"
+        self._status_handlers: list = []
+        self._log_handlers: list = []
+
+        rpc.on_notification("sandbox.status", self._on_status)
+        rpc.on_notification("sandbox.log", self._on_log)
+
+    def _on_status(self, msg):
+        params = msg.get("params", {})
+        self._status = params.get("status", self._status)
+        for handler in self._status_handlers:
+            try:
+                handler(params)
+            except Exception:
+                pass
+
+    def _on_log(self, msg):
+        params = msg.get("params", {})
+        for handler in self._log_handlers:
+            try:
+                handler(params)
+            except Exception:
+                pass
+
+    @property
+    def status(self) -> str:
+        return self._status
+
+    def on_status(self, handler):
+        self._status_handlers.append(handler)
+
+    def on_log(self, handler):
+        self._log_handlers.append(handler)
 
     @classmethod
     async def create(
@@ -86,15 +119,28 @@ class Sandbox:
 
     async def start(self) -> None:
         await self._rpc.call("sandbox.start")
+        self._status = "running"
 
     async def stop(self) -> None:
         await self._rpc.call("sandbox.stop")
 
     async def destroy(self) -> None:
         await self._rpc.call("sandbox.destroy")
+        self._status = "destroyed"
         await self._rpc.close()
         self._process.kill()
         await self._process.wait()
+
+    async def subscribe_logs(self, min_level: str = "info") -> None:
+        await self._rpc.call("log.subscribe", {"min_level": min_level})
+
+    async def export_logs(self) -> str:
+        proc = await self.exec(["cat", "/var/log/vm-agent.log"])
+        output = b""
+        async for chunk in proc.stdout_stream():
+            output += chunk
+        await proc.wait()
+        return output.decode()
 
     async def exec(
         self,
@@ -125,7 +171,6 @@ class Sandbox:
         cwd: str = "/",
         cpu_limit: str | None = None,
         mem_limit: str | None = None,
-        lifetime: str | None = None,
     ) -> Environment:
         params: dict = {"name": name, "cwd": cwd}
         if mounts:

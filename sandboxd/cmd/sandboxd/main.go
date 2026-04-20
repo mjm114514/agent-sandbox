@@ -26,6 +26,8 @@ type daemon struct {
 	vsockStreams   map[int]net.Conn
 	nextStreamID   int
 	portForwarders map[int]net.Listener
+	status         string // "running", "degraded", "dead"
+	lastHeartbeat  time.Time
 }
 
 func main() {
@@ -84,6 +86,8 @@ func (d *daemon) handleSDKCall(method string, params json.RawMessage) (any, erro
 		return d.networkExpose(params)
 	case "env.export":
 		return d.envExport(params)
+	case "sandbox.status":
+		return map[string]any{"status": d.status}, nil
 	default:
 		if d.agentConn == nil {
 			return nil, &rpc.Error{Code: -32601, Message: "vm-agent not connected"}
@@ -213,14 +217,32 @@ func (d *daemon) sandboxStart() (any, error) {
 
 func (d *daemon) setupAgent(controlConn, dataConn net.Conn) {
 	d.agentConn = rpc.NewConn(controlConn, controlConn)
+	d.status = "running"
+	d.lastHeartbeat = time.Now()
 	go d.agentConn.ReadLoop()
 
-	// Forward vm-agent notifications to SDK
+	// Forward vm-agent notifications to SDK, handle heartbeat
 	go func() {
 		for notif := range d.agentConn.Notifications {
-			d.sdk.ForwardNotification(notif)
+			switch notif.Method {
+			case "heartbeat.ping":
+				d.lastHeartbeat = time.Now()
+				if d.status == "degraded" {
+					d.setStatus("running", "heartbeat recovered")
+				}
+			case "log":
+				d.sdk.ForwardNotification(&rpc.Message{
+					Method: "sandbox.log",
+					Params: notif.Params,
+				})
+			default:
+				d.sdk.ForwardNotification(notif)
+			}
 		}
 	}()
+
+	// Start heartbeat monitor
+	go d.heartbeatMonitor()
 
 	// Start netstack with the data channel
 	var err error
@@ -548,4 +570,37 @@ func (d *daemon) envExport(params json.RawMessage) (any, error) {
 func mustMarshal(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+func (d *daemon) heartbeatMonitor() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if d.status == "dead" {
+			return
+		}
+		elapsed := time.Since(d.lastHeartbeat)
+		if elapsed > 60*time.Second && d.status != "dead" {
+			d.setStatus("dead", "no heartbeat for 60s, VM presumed crashed")
+			if d.currentVM != nil {
+				d.currentVM.Destroy()
+			}
+			return
+		}
+		if elapsed > 15*time.Second && d.status == "running" {
+			d.setStatus("degraded", "no heartbeat for 15s")
+		}
+	}
+}
+
+func (d *daemon) setStatus(status, reason string) {
+	d.status = status
+	log.Printf("sandbox status: %s (%s)", status, reason)
+	d.sdk.ForwardNotification(&rpc.Message{
+		Method: "sandbox.status",
+		Params: mustMarshal(map[string]any{
+			"status": status,
+			"reason": reason,
+		}),
+	})
 }

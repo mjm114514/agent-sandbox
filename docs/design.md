@@ -151,7 +151,6 @@ class Sandbox:
         cwd: str = "/",
         cpu_limit: str | None = None,     # e.g. "2" (cores)
         mem_limit: str | None = None,     # e.g. "4G"
-        lifetime: str | None = None,      # e.g. "30m", auto-close
     ) -> Environment: ...
 
     @property
@@ -244,7 +243,6 @@ async def main():
         name="task-123",
         mounts=[Mount("D:/sources/myproject", "/work")],
         cwd="/work",
-        lifetime="30m",
     ) as env:
         proc = await env.exec(["git", "log", "--oneline", "-10"], stream=True)
         async for chunk in proc.stdout:

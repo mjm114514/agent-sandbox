@@ -4,53 +4,66 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"os"
+	"time"
 
 	"github.com/mdlayher/vsock"
 
 	"github.com/anthropics/agent-sandbox/vm-agent/env"
 	vmexec "github.com/anthropics/agent-sandbox/vm-agent/exec"
+	vmlog "github.com/anthropics/agent-sandbox/vm-agent/log"
 	vmmount "github.com/anthropics/agent-sandbox/vm-agent/mount"
 	"github.com/anthropics/agent-sandbox/vm-agent/rpc"
 	"github.com/anthropics/agent-sandbox/vm-agent/tap"
 )
 
 const (
-	hostCID       = 2
-	controlPort   = 1000
-	dataPort      = 1001
+	hostCID     = 2
+	controlPort = 1000
+	dataPort    = 1001
 )
 
+var logger *vmlog.Logger
+
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Println("vm-agent starting")
+	var err error
+	logger, err = vmlog.New("/var/log/vm-agent.log")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "init logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer logger.Close()
+
+	logger.Info("vm-agent starting")
 
 	controlConn, err := vsock.Dial(hostCID, controlPort, nil)
 	if err != nil {
-		log.Fatalf("dial control vsock: %v", err)
+		logger.Error("dial control vsock: %v", err)
+		os.Exit(1)
 	}
 	defer controlConn.Close()
-	log.Println("control channel connected")
+	logger.Info("control channel connected")
 
 	dataConn, err := vsock.Dial(hostCID, dataPort, nil)
 	if err != nil {
-		log.Fatalf("dial data vsock: %v", err)
+		logger.Error("dial data vsock: %v", err)
+		os.Exit(1)
 	}
 	defer dataConn.Close()
-	log.Println("data channel connected")
+	logger.Info("data channel connected")
 
 	bridge, err := tap.New("tap0")
 	if err != nil {
-		log.Fatalf("create tap bridge: %v", err)
+		logger.Error("create tap bridge: %v", err)
+		os.Exit(1)
 	}
 	go func() {
 		if err := bridge.RunTunnel(dataConn); err != nil {
-			log.Fatalf("tap tunnel: %v", err)
+			logger.Error("tap tunnel: %v", err)
 		}
 	}()
-	log.Println("tap bridge running")
+	logger.Info("tap bridge running")
 
 	serve(controlConn)
 }
@@ -61,12 +74,23 @@ func serve(conn net.Conn) {
 	runner := vmexec.NewRunner(rc)
 	mounter := vmmount.NewMounter()
 
+	// Wire up log forwarding over RPC
+	logger.SetNotifier(rc.Notify)
+
+	// Start heartbeat
+	go heartbeat(rc)
+
 	for {
 		msg, err := rc.Read()
 		if err != nil {
-			log.Fatalf("read rpc: %v", err)
+			logger.Error("read rpc: %v", err)
+			os.Exit(1)
 		}
 		if msg.ID == nil {
+			// Handle incoming notifications (heartbeat.pong)
+			if msg.Method == "heartbeat.pong" {
+				continue
+			}
 			continue
 		}
 		id := *msg.ID
@@ -82,6 +106,11 @@ func serve(conn net.Conn) {
 				break
 			}
 			_, rpcErr = envMgr.Create(p)
+			if rpcErr == nil {
+				logger.Info("environment %q created", p.Name)
+			} else {
+				logger.Error("env.create %q: %v", p.Name, rpcErr)
+			}
 			result = map[string]any{"ok": true}
 
 		case "env.close":
@@ -91,6 +120,9 @@ func serve(conn net.Conn) {
 				break
 			}
 			rpcErr = envMgr.Close(p.Name)
+			if rpcErr == nil {
+				logger.Info("environment %q closed", p.Name)
+			}
 			result = map[string]any{"ok": true}
 
 		case "exec.start":
@@ -118,6 +150,17 @@ func serve(conn net.Conn) {
 			rpcErr = runner.WriteStdin(p.PID, data)
 			result = map[string]any{"ok": true}
 
+		case "exec.close_stdin":
+			var p struct {
+				PID int `json:"pid"`
+			}
+			if err := json.Unmarshal(msg.Params, &p); err != nil {
+				rpcErr = fmt.Errorf("parse params: %w", err)
+				break
+			}
+			rpcErr = runner.CloseStdin(p.PID)
+			result = map[string]any{"ok": true}
+
 		case "exec.kill":
 			var p struct {
 				PID    int `json:"pid"`
@@ -128,17 +171,6 @@ func serve(conn net.Conn) {
 				break
 			}
 			rpcErr = runner.Kill(p.PID, p.Signal)
-			result = map[string]any{"ok": true}
-
-		case "exec.close_stdin":
-			var p struct {
-				PID int `json:"pid"`
-			}
-			if err := json.Unmarshal(msg.Params, &p); err != nil {
-				rpcErr = fmt.Errorf("parse params: %w", err)
-				break
-			}
-			rpcErr = runner.CloseStdin(p.PID)
 			result = map[string]any{"ok": true}
 
 		case "env.export":
@@ -177,6 +209,18 @@ func serve(conn net.Conn) {
 			rpcErr = mounter.Unbind(p.GuestPath)
 			result = map[string]any{"ok": true}
 
+		case "log.subscribe":
+			var p struct {
+				MinLevel string `json:"min_level"`
+			}
+			if err := json.Unmarshal(msg.Params, &p); err != nil {
+				rpcErr = fmt.Errorf("parse params: %w", err)
+				break
+			}
+			logger.Subscribe(vmlog.Level(p.MinLevel))
+			logger.Info("log subscription set to %s", p.MinLevel)
+			result = map[string]any{"ok": true}
+
 		default:
 			rpcErr = fmt.Errorf("unknown method: %s", msg.Method)
 		}
@@ -191,4 +235,14 @@ func serve(conn net.Conn) {
 
 func readFileFromGuest(path string) ([]byte, error) {
 	return os.ReadFile(path)
+}
+
+func heartbeat(rc *rpc.Conn) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		rc.Notify("heartbeat.ping", map[string]any{
+			"ts": time.Now().Unix(),
+		})
+	}
 }
