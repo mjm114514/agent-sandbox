@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -17,13 +18,14 @@ import (
 )
 
 type daemon struct {
-	backend      vm.Backend
-	currentVM    vm.VM
-	agentConn    *rpc.Conn
-	sdk          *rpc.StdioServer
-	netSvc       *netstack.Service
-	vsockStreams map[int]net.Conn
-	nextStreamID int
+	backend        vm.Backend
+	currentVM      vm.VM
+	agentConn      *rpc.Conn
+	sdk            *rpc.StdioServer
+	netSvc         *netstack.Service
+	vsockStreams   map[int]net.Conn
+	nextStreamID   int
+	portForwarders map[int]net.Listener
 }
 
 func main() {
@@ -32,7 +34,8 @@ func main() {
 	log.Println("sandboxd starting")
 
 	d := &daemon{
-		vsockStreams: make(map[int]net.Conn),
+		vsockStreams:   make(map[int]net.Conn),
+		portForwarders: make(map[int]net.Listener),
 	}
 	d.detectBackend()
 
@@ -75,6 +78,12 @@ func (d *daemon) handleSDKCall(method string, params json.RawMessage) (any, erro
 		return d.vsockWrite(params)
 	case "vsock.close":
 		return d.vsockClose(params)
+	case "network.forward":
+		return d.networkForward(params)
+	case "network.expose":
+		return d.networkExpose(params)
+	case "env.export":
+		return d.envExport(params)
 	default:
 		if d.agentConn == nil {
 			return nil, &rpc.Error{Code: -32601, Message: "vm-agent not connected"}
@@ -408,6 +417,132 @@ func (d *daemon) vsockClose(params json.RawMessage) (any, error) {
 	conn.Close()
 	delete(d.vsockStreams, p.StreamID)
 	return map[string]any{"ok": true}, nil
+}
+
+func (d *daemon) networkForward(params json.RawMessage) (any, error) {
+	var p struct {
+		HostPort  int `json:"host_port"`
+		GuestPort int `json:"guest_port"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, err
+	}
+
+	if _, ok := d.portForwarders[p.HostPort]; ok {
+		return nil, fmt.Errorf("host port %d already forwarded", p.HostPort)
+	}
+
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p.HostPort))
+	if err != nil {
+		return nil, fmt.Errorf("listen on host port %d: %w", p.HostPort, err)
+	}
+	d.portForwarders[p.HostPort] = ln
+
+	guestAddr := fmt.Sprintf("10.0.2.1:%d", p.GuestPort)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				guest, err := net.Dial("tcp", guestAddr)
+				if err != nil {
+					log.Printf("forward to guest %s: %v", guestAddr, err)
+					return
+				}
+				defer guest.Close()
+				go io.Copy(guest, conn)
+				io.Copy(conn, guest)
+			}()
+		}
+	}()
+
+	log.Printf("port forward: host:%d -> guest:%d", p.HostPort, p.GuestPort)
+	return map[string]any{"ok": true}, nil
+}
+
+func (d *daemon) networkExpose(params json.RawMessage) (any, error) {
+	var p struct {
+		GuestPort int `json:"guest_port"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, err
+	}
+
+	// Expose on a random available host port
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	hostPort := ln.Addr().(*net.TCPAddr).Port
+	d.portForwarders[hostPort] = ln
+
+	guestAddr := fmt.Sprintf("10.0.2.1:%d", p.GuestPort)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				guest, err := net.Dial("tcp", guestAddr)
+				if err != nil {
+					return
+				}
+				defer guest.Close()
+				go io.Copy(guest, conn)
+				io.Copy(conn, guest)
+			}()
+		}
+	}()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d", hostPort)
+	log.Printf("exposed guest:%d at %s", p.GuestPort, url)
+	return map[string]any{"url": url}, nil
+}
+
+func (d *daemon) envExport(params json.RawMessage) (any, error) {
+	var p struct {
+		Name      string `json:"name"`
+		GuestPath string `json:"guest_path"`
+		HostPath  string `json:"host_path"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, err
+	}
+
+	if d.agentConn == nil {
+		return nil, fmt.Errorf("vm-agent not connected")
+	}
+
+	result, err := d.agentConn.Call("env.export", map[string]string{
+		"name":       p.Name,
+		"guest_path": p.GuestPath,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var resp struct {
+		DataB64 string `json:"data_b64"`
+	}
+	if err := json.Unmarshal(*result, &resp); err != nil {
+		return nil, err
+	}
+
+	data, err := base64.StdEncoding.DecodeString(resp.DataB64)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := os.WriteFile(p.HostPath, data, 0644); err != nil {
+		return nil, fmt.Errorf("write to host %s: %w", p.HostPath, err)
+	}
+
+	return map[string]any{"ok": true, "size": len(data)}, nil
 }
 
 func mustMarshal(v any) json.RawMessage {

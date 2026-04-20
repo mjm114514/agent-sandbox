@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 
 	"github.com/mdlayher/vsock"
 
@@ -129,6 +130,35 @@ func serve(conn net.Conn) {
 			rpcErr = runner.Kill(p.PID, p.Signal)
 			result = map[string]any{"ok": true}
 
+		case "exec.close_stdin":
+			var p struct {
+				PID int `json:"pid"`
+			}
+			if err := json.Unmarshal(msg.Params, &p); err != nil {
+				rpcErr = fmt.Errorf("parse params: %w", err)
+				break
+			}
+			rpcErr = runner.CloseStdin(p.PID)
+			result = map[string]any{"ok": true}
+
+		case "env.export":
+			var p struct {
+				Name      string `json:"name"`
+				GuestPath string `json:"guest_path"`
+			}
+			if err := json.Unmarshal(msg.Params, &p); err != nil {
+				rpcErr = fmt.Errorf("parse params: %w", err)
+				break
+			}
+			data, err := readFileFromGuest(p.GuestPath)
+			if err != nil {
+				rpcErr = err
+			} else {
+				result = map[string]any{
+					"data_b64": base64.StdEncoding.EncodeToString(data),
+				}
+			}
+
 		case "mount.bind":
 			var p vmmount.BindParams
 			if err := json.Unmarshal(msg.Params, &p); err != nil {
@@ -157,4 +187,8 @@ func serve(conn net.Conn) {
 			rc.Reply(id, result)
 		}
 	}
+}
+
+func readFileFromGuest(path string) ([]byte, error) {
+	return os.ReadFile(path)
 }

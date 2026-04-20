@@ -84,6 +84,8 @@ func (m *Manager) Get(name string) (*Environment, bool) {
 }
 
 func createUser(user string) error {
+	exec.Command("userdel", "--remove", user).Run()
+	exec.Command("groupdel", user).Run()
 	out, err := exec.Command("useradd", "--create-home", "--shell", "/bin/sh", user).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s: %w", out, err)
@@ -93,6 +95,7 @@ func createUser(user string) error {
 
 func deleteUser(user string) {
 	exec.Command("userdel", "--remove", user).Run()
+	exec.Command("groupdel", user).Run()
 }
 
 func killUserProcesses(user string) {

@@ -58,6 +58,9 @@ class Process:
             "data_b64": base64.b64encode(data).decode(),
         })
 
+    async def close_stdin(self) -> None:
+        await self._rpc.call("exec.close_stdin", {"pid": self.pid})
+
     async def wait(self) -> int:
         return await self._exit_future
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -55,6 +56,16 @@ func (b *Backend) Create(cfg vmapi.Config) (vmapi.VM, error) {
 	absInitrd, _ := filepath.Abs(initrdPath)
 	absRootfs, _ := filepath.Abs(rootfsPath)
 
+	// Create a differencing disk so the base image stays read-only
+	diffVhdx := filepath.Join(os.TempDir(), fmt.Sprintf("sandbox-%s-rootfs.vhdx", id))
+	createDiffScript := fmt.Sprintf(
+		`New-VHD -Path '%s' -ParentPath '%s' -Differencing | Out-Null`,
+		diffVhdx, absRootfs,
+	)
+	if out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", createDiffScript).CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("create differencing disk: %s: %w", string(out), err)
+	}
+
 	// Build vsock port list
 	vsockPorts := make(map[uint32]bool)
 	vsockPorts[1000] = true // control
@@ -92,7 +103,7 @@ func (b *Backend) Create(cfg vmapi.Config) (vmapi.VM, error) {
 						"Attachments": map[string]any{
 							"0": map[string]any{
 								"Type": "VirtualDisk",
-								"Path":  absRootfs,
+								"Path":  diffVhdx,
 							},
 						},
 					},
@@ -113,11 +124,12 @@ func (b *Backend) Create(cfg vmapi.Config) (vmapi.VM, error) {
 	}
 
 	vm := &hcsVM{
-		id:      id,
-		cfg:     cfg,
-		state:   vmapi.StateStopped,
-		shares:  make(map[string]string),
-		bootDir: b.BootDir,
+		id:       id,
+		cfg:      cfg,
+		state:    vmapi.StateStopped,
+		shares:   make(map[string]string),
+		bootDir:  b.BootDir,
+		diffVhdx: diffVhdx,
 	}
 
 	docUTF16, err := syscall.UTF16PtrFromString(string(docBytes))
@@ -162,8 +174,9 @@ type hcsVM struct {
 	cfg     vmapi.Config
 	state   vmapi.State
 	shares  map[string]string
-	bootDir string
-	vmID    guid.GUID
+	bootDir  string
+	diffVhdx string
+	vmID     guid.GUID
 }
 
 func (v *hcsVM) ID() string {
@@ -255,6 +268,9 @@ func (v *hcsVM) Stop() error {
 func (v *hcsVM) Destroy() error {
 	v.Stop()
 	procHcsCloseComputeSystem.Call(uintptr(v.handle))
+	if v.diffVhdx != "" {
+		os.Remove(v.diffVhdx)
+	}
 	return nil
 }
 

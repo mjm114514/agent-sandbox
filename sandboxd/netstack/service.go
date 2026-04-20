@@ -92,6 +92,12 @@ func (svc *Service) Run() error {
 	return nil
 }
 
+func (svc *Service) Close() {
+	svc.cancel()
+	svc.vsock.Close()
+	svc.s.Close()
+}
+
 func (svc *Service) readFromVsock() {
 	defer svc.cancel()
 	hdr := make([]byte, 4)

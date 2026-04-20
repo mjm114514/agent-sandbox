@@ -111,6 +111,16 @@ func (r *Runner) WriteStdin(pid int, data []byte) error {
 	return err
 }
 
+func (r *Runner) CloseStdin(pid int) error {
+	r.mu.Lock()
+	mp, ok := r.processes[pid]
+	r.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("process %d not found", pid)
+	}
+	return mp.stdin.Close()
+}
+
 func (r *Runner) Kill(pid int, signal int) error {
 	r.mu.Lock()
 	_, ok := r.processes[pid]
