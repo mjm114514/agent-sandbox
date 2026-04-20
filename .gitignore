@@ -1,0 +1,39 @@
+# Build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go
+/sandboxd/sandboxd
+/vm-agent/vm-agent
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# VM image build
+/images/_build/
+/images/output/
+/images/base/vm-agent
+
+# Boot files (built from image)
+/sandboxd/boot/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+/tests/debug_vm/
