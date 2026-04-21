@@ -1,5 +1,5 @@
 """
-Smoke test: verify SDK can spawn sandboxd and exchange JSON-RPC messages.
+Smoke test: verify SDK can spawn as-hostd and exchange JSON-RPC messages.
 Does not require a real VM — tests the control plane only.
 """
 import asyncio
@@ -8,14 +8,14 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sdk"))
 
-from sandbox._binary import find_sandboxd
+from sandbox._binary import find_hostd
 from sandbox._rpc import RpcConn, RpcError
 
 
 async def test_stdio_rpc():
-    """Test that sandboxd responds to JSON-RPC calls over stdio."""
+    """Test that as-hostd responds to JSON-RPC calls over stdio."""
     proc = await asyncio.create_subprocess_exec(
-        find_sandboxd(),
+        find_hostd(),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

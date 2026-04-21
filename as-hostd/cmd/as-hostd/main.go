@@ -12,10 +12,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/anthropics/agent-sandbox/sandboxd/netstack"
-	"github.com/anthropics/agent-sandbox/sandboxd/rpc"
-	"github.com/anthropics/agent-sandbox/sandboxd/vm"
-	"github.com/anthropics/agent-sandbox/sandboxd/vm/hcs"
+	"github.com/anthropics/agent-sandbox/as-hostd/netstack"
+	"github.com/anthropics/agent-sandbox/as-hostd/rpc"
+	"github.com/anthropics/agent-sandbox/as-hostd/vm"
+	"github.com/anthropics/agent-sandbox/as-hostd/vm/hcs"
 )
 
 type vmMount struct {
@@ -42,7 +42,7 @@ type daemon struct {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.SetOutput(os.Stderr)
-	log.Println("sandboxd starting")
+	log.Println("as-hostd starting")
 
 	d := &daemon{
 		vsockStreams:   make(map[int]net.Conn),
@@ -60,7 +60,7 @@ func main() {
 }
 
 func (d *daemon) detectBackend() {
-	bootDir := os.Getenv("SANDBOXD_BOOT_DIR")
+	bootDir := os.Getenv("AS_HOSTD_BOOT_DIR")
 	if bootDir == "" {
 		bootDir = filepath.Join(filepath.Dir(os.Args[0]), "boot")
 	}
@@ -104,7 +104,7 @@ func (d *daemon) handleSDKCall(method string, params json.RawMessage) (any, erro
 		return map[string]any{"status": status}, nil
 	default:
 		if d.agentConn == nil {
-			return nil, &rpc.Error{Code: -32601, Message: "vm-agent not connected"}
+			return nil, &rpc.Error{Code: -32601, Message: "as-guestd not connected"}
 		}
 		result, err := d.agentConn.Call(method, json.RawMessage(params))
 		if err != nil {
@@ -190,7 +190,7 @@ func (d *daemon) sandboxStart() (any, error) {
 		return nil, fmt.Errorf("start vm: %w", err)
 	}
 
-	// Listen for vm-agent control channel
+	// Listen for as-guestd control channel
 	controlListener, err := d.currentVM.VSockListen(1000)
 	if err != nil {
 		return nil, fmt.Errorf("vsock listen control: %w", err)
@@ -203,7 +203,7 @@ func (d *daemon) sandboxStart() (any, error) {
 		return nil, fmt.Errorf("vsock listen data: %w", err)
 	}
 
-	log.Println("waiting for vm-agent control connection (timeout 30s)...")
+	log.Println("waiting for as-guestd control connection (timeout 30s)...")
 
 	// Use a goroutine + channel to implement accept with timeout
 	type acceptResult struct {
@@ -221,21 +221,21 @@ func (d *daemon) sandboxStart() (any, error) {
 		if result.err != nil {
 			return nil, fmt.Errorf("accept control: %w", result.err)
 		}
-		log.Println("vm-agent control connected")
+		log.Println("as-guestd control connected")
 
-		log.Println("waiting for vm-agent data connection...")
+		log.Println("waiting for as-guestd data connection...")
 		dataConn, err := dataListener.Accept()
 		if err != nil {
 			result.conn.Close()
 			return nil, fmt.Errorf("accept data: %w", err)
 		}
-		log.Println("vm-agent data connected")
+		log.Println("as-guestd data connected")
 		d.setupAgent(result.conn, dataConn)
 
 	case <-time.After(60 * time.Second):
 		controlListener.Close()
 		dataListener.Close()
-		return nil, fmt.Errorf("timeout waiting for vm-agent to connect — VM may have failed to boot. Check if hv_sock module is available in the guest kernel")
+		return nil, fmt.Errorf("timeout waiting for as-guestd to connect — VM may have failed to boot. Check if hv_sock module is available in the guest kernel")
 	}
 
 	// Share and bind VM-level mounts
@@ -262,7 +262,7 @@ func (d *daemon) setupAgent(controlConn, dataConn net.Conn) {
 	d.lastHeartbeat = time.Now()
 	go d.agentConn.ReadLoop()
 
-	// Forward vm-agent notifications to SDK, handle heartbeat
+	// Forward as-guestd notifications to SDK, handle heartbeat
 	go func() {
 		for notif := range d.agentConn.Notifications {
 			switch notif.Method {
@@ -341,17 +341,17 @@ func (d *daemon) envCreate(params json.RawMessage) (any, error) {
 	}
 
 	if d.agentConn == nil {
-		return nil, fmt.Errorf("vm-agent not connected")
+		return nil, fmt.Errorf("as-guestd not connected")
 	}
 
-	// Provision mounts: share host dirs into VM, then tell vm-agent to bind them
+	// Provision mounts: share host dirs into VM, then tell as-guestd to bind them
 	var agentMounts []map[string]string
 	for i, m := range p.Mounts {
 		tag := fmt.Sprintf("env-%s-mount-%d", p.Name, i)
 		if err := d.currentVM.ShareDir(tag, m.HostPath); err != nil {
 			return nil, fmt.Errorf("share dir %s: %w", m.HostPath, err)
 		}
-		// Tell vm-agent to mount the virtiofs share
+		// Tell as-guestd to mount the virtiofs share
 		_, err := d.agentConn.Call("mount.bind", map[string]string{
 			"virtiofs_tag": tag,
 			"guest_path":   m.GuestPath,
@@ -366,7 +366,7 @@ func (d *daemon) envCreate(params json.RawMessage) (any, error) {
 		})
 	}
 
-	// Create the environment on vm-agent
+	// Create the environment on as-guestd
 	agentParams := map[string]any{
 		"name": p.Name,
 		"cwd":  p.Cwd,
@@ -596,7 +596,7 @@ func (d *daemon) envExport(params json.RawMessage) (any, error) {
 	}
 
 	if d.agentConn == nil {
-		return nil, fmt.Errorf("vm-agent not connected")
+		return nil, fmt.Errorf("as-guestd not connected")
 	}
 
 	f, err := os.Create(p.HostPath)

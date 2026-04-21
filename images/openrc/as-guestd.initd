@@ -1,0 +1,14 @@
+#!/sbin/openrc-run
+
+name="as-guestd"
+description="Agent Sandbox Guest Daemon"
+command="/usr/local/bin/as-guestd"
+command_background="yes"
+pidfile="/run/as-guestd.pid"
+output_log="/var/log/as-guestd.log"
+error_log="/var/log/as-guestd.log"
+
+depend() {
+    need localmount
+    after bootmisc
+}

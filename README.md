@@ -14,7 +14,7 @@ For architecture and design rationale, see [docs/design.md](docs/design.md).
 - **Mount host directories** into the VM or into a specific environment, read-only or read-write.
 - **Streaming process I/O** for stdout, stderr, stdin, signals, and exit codes.
 - **Vsock ports** for direct host↔guest communication to build custom services (proxies, credential brokers, etc.).
-- **Python SDK** with `asyncio` API; Go daemon (`sandboxd`) + in-guest agent (`vm-agent`).
+- **Python SDK** with `asyncio` API; Go host daemon (`as-hostd`) + in-guest daemon (`as-guestd`).
 
 ## Quick Start
 
@@ -49,17 +49,17 @@ asyncio.run(main())
 
 - **Windows**: Hyper-V enabled, admin privileges
 - **macOS**: Apple Silicon (AVF support) — *not yet implemented*
-- **Go 1.21+** (for building sandboxd and vm-agent)
+- **Go 1.21+** (for building as-hostd and as-guestd)
 - **Python 3.12+** (for the SDK)
 - **WSL2 with Ubuntu** (for building the VM image on Windows)
 
 ## Building
 
-### 1. Build sandboxd
+### 1. Build as-hostd
 
 ```bash
-cd sandboxd
-go build -o sandboxd.exe ./cmd/sandboxd/   # Windows
+cd as-hostd
+go build -o as-hostd.exe ./cmd/as-hostd/   # Windows
 ```
 
 ### 2. Build the VM image
@@ -67,15 +67,15 @@ go build -o sandboxd.exe ./cmd/sandboxd/   # Windows
 Requires WSL2 with `qemu-utils` installed:
 
 ```bash
-# Build vm-agent
-cd vm-agent
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o vm-agent ./cmd/vm-agent/
+# Build as-guestd
+cd as-guestd
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o as-guestd ./cmd/as-guestd/
 
 # Build the image (runs in WSL, needs sudo)
 wsl -e sudo bash images/build-wsl.sh
 ```
 
-This produces `sandboxd/boot/{vmlinuz, initramfs, rootfs.vhdx}`.
+This produces `as-hostd/boot/{vmlinuz, initramfs, rootfs.vhdx}`.
 
 ### 3. Install the SDK
 
@@ -144,8 +144,8 @@ async with await sb.vsock_connect(2000) as stream:
 ```
 agent-sandbox/
 ├── docs/                   Design documents
-├── sandboxd/               Host-side daemon (Go)
-├── vm-agent/               Guest-side agent (Go)
+├── as-hostd/               Host-side daemon (Go)
+├── as-guestd/              Guest-side daemon (Go)
 ├── sdk/                    Python SDK
 ├── images/                 VM image build scripts
 └── tests/                  Integration tests
@@ -156,7 +156,7 @@ agent-sandbox/
 Working end-to-end on Windows (HCS backend). The following is verified:
 
 - VM creation and direct kernel boot via HCS
-- vm-agent ↔ sandboxd communication over Hyper-V sockets
+- as-guestd ↔ as-hostd communication over Hyper-V sockets
 - Process execution at both VM and environment level
 - Environment isolation (per-user + bwrap namespaces)
 - Network forwarding through gVisor netstack

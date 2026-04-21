@@ -2,29 +2,29 @@
 
 ## Overview
 
-This document describes the mechanisms for detecting failures, maintaining connection health between sandboxd and vm-agent, and surfacing diagnostic information to SDK callers.
+This document describes the mechanisms for detecting failures, maintaining connection health between as-hostd and as-guestd, and surfacing diagnostic information to SDK callers.
 
 ## Heartbeat
 
-The control channel between sandboxd and vm-agent carries a bidirectional heartbeat to detect connection loss and VM hangs.
+The control channel between as-hostd and as-guestd carries a bidirectional heartbeat to detect connection loss and VM hangs.
 
 ### Protocol
 
-vm-agent sends a `heartbeat.ping` notification to sandboxd every **5 seconds**. sandboxd tracks the timestamp of the last received ping.
+as-guestd sends a `heartbeat.ping` notification to as-hostd every **5 seconds**. as-hostd tracks the timestamp of the last received ping.
 
 ```json
 {"jsonrpc": "2.0", "method": "heartbeat.ping", "params": {"ts": 1713600000}}
 ```
 
-If sandboxd does not receive a ping for **15 seconds** (3 missed intervals), it considers the vm-agent unreachable and transitions the sandbox to a `degraded` state. The SDK is notified via a `sandbox.status` notification.
+If as-hostd does not receive a ping for **15 seconds** (3 missed intervals), it considers the as-guestd unreachable and transitions the sandbox to a `degraded` state. The SDK is notified via a `sandbox.status` notification.
 
-sandboxd also sends `heartbeat.pong` back to vm-agent so the guest can detect host-side failures:
+as-hostd also sends `heartbeat.pong` back to as-guestd so the guest can detect host-side failures:
 
 ```json
 {"jsonrpc": "2.0", "method": "heartbeat.pong", "params": {"ts": 1713600000}}
 ```
 
-If vm-agent does not receive a pong for 15 seconds, it logs a warning and continues operating — the guest has no alternative host to fall back to, but the log record helps diagnose connectivity issues.
+If as-guestd does not receive a pong for 15 seconds, it logs a warning and continues operating — the guest has no alternative host to fall back to, but the log record helps diagnose connectivity issues.
 
 ### State Machine
 
@@ -46,7 +46,7 @@ If vm-agent does not receive a pong for 15 seconds, it logs a warning and contin
                   └──────────┘
 ```
 
-When the sandbox enters `dead` state, sandboxd:
+When the sandbox enters `dead` state, as-hostd:
 1. Sends a `sandbox.status` notification to the SDK with `{"state": "dead", "reason": "..."}`.
 2. Terminates the VM via HCS.
 3. Rejects further RPC calls with a clear error message.
@@ -62,9 +62,9 @@ The SDK's `Sandbox.start()` begins the heartbeat monitor. `Sandbox.destroy()` st
 
 ## Logging
 
-### Guest-Side (vm-agent)
+### Guest-Side (as-guestd)
 
-vm-agent writes structured log lines to `/var/log/vm-agent.log` in the guest. These logs are also forwarded to sandboxd over the control channel as notifications:
+as-guestd writes structured log lines to `/var/log/as-guestd.log` in the guest. These logs are also forwarded to as-hostd over the control channel as notifications:
 
 ```json
 {"jsonrpc": "2.0", "method": "log", "params": {"level": "error", "msg": "tap bridge failed", "ts": 1713600000}}
@@ -72,7 +72,7 @@ vm-agent writes structured log lines to `/var/log/vm-agent.log` in the guest. Th
 
 Log levels: `debug`, `info`, `warn`, `error`.
 
-sandboxd forwards these to the SDK as `sandbox.log` notifications. The SDK provides a way to consume them:
+as-hostd forwards these to the SDK as `sandbox.log` notifications. The SDK provides a way to consume them:
 
 ```python
 sb.on_log(callback)       # register a log handler
@@ -85,19 +85,19 @@ By default, logs are not forwarded to avoid noise. The SDK enables forwarding by
 {"jsonrpc": "2.0", "id": 1, "method": "log.subscribe", "params": {"min_level": "info"}}
 ```
 
-### Host-Side (sandboxd)
+### Host-Side (as-hostd)
 
-sandboxd writes its own logs to stderr (already the case). No changes needed — the SDK's subprocess already captures stderr.
+as-hostd writes its own logs to stderr (already the case). No changes needed — the SDK's subprocess already captures stderr.
 
 ### Log Export
 
 The SDK provides a method to retrieve the full guest log file:
 
 ```python
-logs = await sb.export_logs()   # returns the content of /var/log/vm-agent.log
+logs = await sb.export_logs()   # returns the content of /var/log/as-guestd.log
 ```
 
-This is implemented as a regular `exec` call: `cat /var/log/vm-agent.log`.
+This is implemented as a regular `exec` call: `cat /var/log/as-guestd.log`.
 
 ## Error Handling in RPC
 
@@ -110,7 +110,7 @@ All SDK RPC calls have a configurable timeout (default 30s). If the call times o
 
 ### Connection Loss
 
-If the sandboxd process exits unexpectedly (stdin/stdout pipe breaks):
+If the as-hostd process exits unexpectedly (stdin/stdout pipe breaks):
 1. The SDK's `_read_loop` catches the `IncompleteReadError`.
 2. All pending futures are rejected with `ConnectionLostError`.
 3. `sb.status` transitions to `"dead"`.
@@ -119,18 +119,18 @@ If the sandboxd process exits unexpectedly (stdin/stdout pipe breaks):
 
 If the HCS VM exits unexpectedly (kernel panic, OOM kill):
 1. The vsock connections close, triggering EOF in the heartbeat monitor.
-2. sandboxd detects the heartbeat timeout and moves to `dead`.
-3. sandboxd sends `sandbox.status` notification with the reason.
+2. as-hostd detects the heartbeat timeout and moves to `dead`.
+3. as-hostd sends `sandbox.status` notification with the reason.
 4. Subsequent RPC calls return clear errors.
 
 ## Implementation Plan
 
-### vm-agent changes
+### as-guestd changes
 - Add heartbeat goroutine: sends `heartbeat.ping` every 5s on the control channel.
 - Add `log.subscribe` RPC handler.
 - Add structured logging helper that writes to both file and control channel.
 
-### sandboxd changes
+### as-hostd changes
 - Add heartbeat monitor goroutine: tracks last ping time, manages state transitions.
 - Forward `sandbox.status` and `sandbox.log` notifications to SDK.
 - Add `sandbox.status` RPC method for polling.

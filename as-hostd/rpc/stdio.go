@@ -8,10 +8,10 @@ import (
 )
 
 // StdioServer reads JSON-RPC messages from the SDK (over stdin) and writes
-// responses to stdout. It forwards calls to the vm-agent Conn when needed.
+// responses to stdout. It forwards calls to the as-guestd Conn when needed.
 type StdioServer struct {
 	conn    *Conn       // connection to the SDK (stdin/stdout)
-	agent   *Conn       // connection to the vm-agent (vsock control)
+	agent   *Conn       // connection to the as-guestd (vsock control)
 	handler func(method string, params json.RawMessage) (any, error)
 }
 
@@ -65,7 +65,7 @@ func (s *StdioServer) handleCall(method string, params json.RawMessage) (any, er
 		return s.handler(method, params)
 	}
 
-	// Default: forward to vm-agent
+	// Default: forward to as-guestd
 	result, err := s.agent.Call(method, params)
 	if err != nil {
 		return nil, err
@@ -80,7 +80,7 @@ func (s *StdioServer) ForwardNotification(msg *Message) {
 	}
 }
 
-// ForwardNotifications reads notifications from the vm-agent and forwards
+// ForwardNotifications reads notifications from the as-guestd and forwards
 // them to the SDK over stdout. Run in a goroutine.
 func (s *StdioServer) ForwardNotifications() {
 	if s.agent == nil {

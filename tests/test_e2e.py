@@ -1,5 +1,5 @@
 """
-End-to-end test: SDK → sandboxd → HCS → VM → vm-agent
+End-to-end test: SDK → as-hostd → HCS → VM → as-guestd
 """
 import asyncio
 import os
@@ -9,8 +9,8 @@ import sys
 import base64
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sdk"))
-from sandbox._binary import find_sandboxd
-SANDBOXD = find_sandboxd()
+from sandbox._binary import find_hostd
+HOSTD = find_hostd()
 
 
 class SimpleRPC:
@@ -65,11 +65,11 @@ class SimpleRPC:
 
 
 async def main():
-    print(f"sandboxd: {SANDBOXD}")
+    print(f"as-hostd: {HOSTD}")
     print()
 
     proc = await asyncio.create_subprocess_exec(
-        SANDBOXD,
+        HOSTD,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -80,7 +80,7 @@ async def main():
             line = await proc.stderr.readline()
             if not line:
                 break
-            print(f"  [sandboxd] {line.decode().rstrip()}")
+            print(f"  [as-hostd] {line.decode().rstrip()}")
 
     stderr_task = asyncio.create_task(read_stderr())
     rpc = SimpleRPC(proc.stdout, proc.stdin)

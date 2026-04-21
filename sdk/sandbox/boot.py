@@ -40,7 +40,7 @@ def boot_cache_dir() -> Path:
 
 
 def find_boot_dir() -> Path | None:
-    for env_var in ("SANDBOXD_BOOT_DIR", "AGENT_SANDBOX_BOOT_DIR"):
+    for env_var in ("AS_HOSTD_BOOT_DIR", "AGENT_SANDBOX_BOOT_DIR"):
         val = os.environ.get(env_var)
         if val and _has_boot_files(Path(val)):
             return Path(val)
@@ -49,10 +49,10 @@ def find_boot_dir() -> Path | None:
     if _has_boot_files(cache):
         return cache
 
-    # Dev layout: <repo>/sandboxd/boot/
+    # Dev layout: <repo>/as-hostd/boot/
     try:
         repo_root = _find_repo_root()
-        dev_boot = repo_root / "sandboxd" / "boot"
+        dev_boot = repo_root / "as-hostd" / "boot"
         if _has_boot_files(dev_boot):
             return dev_boot
     except FileNotFoundError:

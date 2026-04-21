@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
     boot_sub.add_parser("clean", help="Remove cached boot files")
 
     # --- sandbox build ---
-    sub.add_parser("build", help="Build sandboxd binary from Go source")
+    sub.add_parser("build", help="Build as-hostd binary from Go source")
 
     args = parser.parse_args(argv)
 

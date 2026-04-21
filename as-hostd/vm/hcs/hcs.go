@@ -15,7 +15,7 @@ import (
 	winio "github.com/Microsoft/go-winio"
 	"github.com/Microsoft/go-winio/pkg/guid"
 
-	vmapi "github.com/anthropics/agent-sandbox/sandboxd/vm"
+	vmapi "github.com/anthropics/agent-sandbox/as-hostd/vm"
 )
 
 var (

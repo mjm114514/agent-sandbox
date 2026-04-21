@@ -1,4 +1,4 @@
-module github.com/anthropics/agent-sandbox/sandboxd
+module github.com/anthropics/agent-sandbox/as-hostd
 
 go 1.26.2
 

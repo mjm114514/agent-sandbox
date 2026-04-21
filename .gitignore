@@ -7,8 +7,8 @@ CLAUDE.local.md
 *.dylib
 
 # Go
-/sandboxd/sandboxd
-/vm-agent/vm-agent
+/as-hostd/as-hostd
+/as-guestd/as-guestd
 
 # Python
 __pycache__/
@@ -22,10 +22,10 @@ sdk/sandbox/_bin/
 # VM image build
 /images/_build/
 /images/output/
-/images/base/vm-agent
+/images/base/as-guestd
 
 # Boot files (built from image)
-/sandboxd/boot/
+/as-hostd/boot/
 
 # IDE
 .idea/

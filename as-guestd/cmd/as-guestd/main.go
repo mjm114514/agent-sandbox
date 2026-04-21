@@ -10,12 +10,12 @@ import (
 
 	"github.com/mdlayher/vsock"
 
-	"github.com/anthropics/agent-sandbox/vm-agent/env"
-	vmexec "github.com/anthropics/agent-sandbox/vm-agent/exec"
-	vmlog "github.com/anthropics/agent-sandbox/vm-agent/log"
-	vmmount "github.com/anthropics/agent-sandbox/vm-agent/mount"
-	"github.com/anthropics/agent-sandbox/vm-agent/rpc"
-	"github.com/anthropics/agent-sandbox/vm-agent/tap"
+	"github.com/anthropics/agent-sandbox/as-guestd/env"
+	vmexec "github.com/anthropics/agent-sandbox/as-guestd/exec"
+	vmlog "github.com/anthropics/agent-sandbox/as-guestd/log"
+	vmmount "github.com/anthropics/agent-sandbox/as-guestd/mount"
+	"github.com/anthropics/agent-sandbox/as-guestd/rpc"
+	"github.com/anthropics/agent-sandbox/as-guestd/tap"
 )
 
 const (
@@ -28,14 +28,14 @@ var logger *vmlog.Logger
 
 func main() {
 	var err error
-	logger, err = vmlog.New("/var/log/vm-agent.log")
+	logger, err = vmlog.New("/var/log/as-guestd.log")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "init logger: %v\n", err)
 		os.Exit(1)
 	}
 	defer logger.Close()
 
-	logger.Info("vm-agent starting")
+	logger.Info("as-guestd starting")
 
 	controlConn, err := vsock.Dial(hostCID, controlPort, nil)
 	if err != nil {

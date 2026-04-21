@@ -5,7 +5,7 @@ import os
 import sys
 from typing import Literal
 
-from sandbox._binary import find_sandboxd
+from sandbox._binary import find_hostd
 from sandbox._rpc import RpcConn
 from sandbox.boot import find_boot_dir
 from sandbox.environment import Environment
@@ -84,13 +84,13 @@ class Sandbox:
         mounts: list[Mount] | None = None,
         vsock_ports: list[int] | None = None,
     ) -> Sandbox:
-        sandboxd_path = find_sandboxd()
+        hostd_path = find_hostd()
         env = dict(os.environ)
         boot_dir = find_boot_dir()
         if boot_dir is not None:
-            env["SANDBOXD_BOOT_DIR"] = str(boot_dir)
+            env["AS_HOSTD_BOOT_DIR"] = str(boot_dir)
         proc = await asyncio.create_subprocess_exec(
-            sandboxd_path,
+            hostd_path,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=sys.stderr,
@@ -144,7 +144,7 @@ class Sandbox:
         await self._rpc.call("log.subscribe", {"min_level": min_level})
 
     async def export_logs(self) -> str:
-        proc = await self.exec(["cat", "/var/log/vm-agent.log"])
+        proc = await self.exec(["cat", "/var/log/as-guestd.log"])
         output = b""
         async for chunk in proc.stdout_stream():
             output += chunk

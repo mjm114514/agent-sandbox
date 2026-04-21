@@ -1,4 +1,4 @@
-module github.com/anthropics/agent-sandbox/vm-agent
+module github.com/anthropics/agent-sandbox/as-guestd
 
 go 1.26.2
 

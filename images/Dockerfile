@@ -3,13 +3,13 @@ ARG ALPINE_VERSION=3.21
 ARG GO_VERSION=1.23
 ARG DISK_SIZE_MB=2048
 
-# ---- Stage 1: build vm-agent ----
-FROM --platform=linux/amd64 golang:${GO_VERSION}-alpine AS vmagent
+# ---- Stage 1: build as-guestd ----
+FROM --platform=linux/amd64 golang:${GO_VERSION}-alpine AS guestd
 WORKDIR /src
-COPY vm-agent/ ./vm-agent/
-WORKDIR /src/vm-agent
+COPY as-guestd/ ./as-guestd/
+WORKDIR /src/as-guestd
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -ldflags="-s -w" -o /out/vm-agent ./cmd/vm-agent/
+    go build -ldflags="-s -w" -o /out/as-guestd ./cmd/as-guestd/
 
 # ---- Stage 2: assemble rootfs + build disk ----
 FROM --platform=linux/amd64 alpine:${ALPINE_VERSION} AS rootfs
@@ -52,14 +52,14 @@ RUN chroot /rootfs /bin/sh -c '\
     mkinitfs -o /boot/initramfs $(ls /lib/modules/ | head -1) 2>/dev/null || true && \
     rm -rf /var/cache/apk/*'
 
-# Install vm-agent
-COPY --from=vmagent /out/vm-agent /rootfs/usr/local/bin/vm-agent
-RUN chmod +x /rootfs/usr/local/bin/vm-agent
+# Install as-guestd
+COPY --from=guestd /out/as-guestd /rootfs/usr/local/bin/as-guestd
+RUN chmod +x /rootfs/usr/local/bin/as-guestd
 
 # OpenRC init script
-COPY images/openrc/vm-agent.initd /rootfs/etc/init.d/vm-agent
-RUN chmod +x /rootfs/etc/init.d/vm-agent && \
-    chroot /rootfs rc-update add vm-agent default
+COPY images/openrc/as-guestd.initd /rootfs/etc/init.d/as-guestd
+RUN chmod +x /rootfs/etc/init.d/as-guestd && \
+    chroot /rootfs rc-update add as-guestd default
 
 # System config
 COPY images/etc/fstab /rootfs/etc/fstab

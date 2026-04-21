@@ -22,40 +22,40 @@ ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
 ALPINE_MINIROOTFS_URL="$ALPINE_MIRROR/v$ALPINE_VERSION/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz"
 DISK_SIZE_MB=2048
 
-# Preserve pre-built vm-agent if it exists
-VM_AGENT_PREBUILT=""
-if [ -f "$BUILD_DIR/vm-agent" ]; then
-    VM_AGENT_PREBUILT="$(mktemp)"
-    cp "$BUILD_DIR/vm-agent" "$VM_AGENT_PREBUILT"
+# Preserve pre-built as-guestd if it exists
+AS_GUESTD_PREBUILT=""
+if [ -f "$BUILD_DIR/as-guestd" ]; then
+    AS_GUESTD_PREBUILT="$(mktemp)"
+    cp "$BUILD_DIR/as-guestd" "$AS_GUESTD_PREBUILT"
 fi
 
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
 
-# Restore pre-built vm-agent
-if [ -n "$VM_AGENT_PREBUILT" ]; then
-    mv "$VM_AGENT_PREBUILT" "$BUILD_DIR/vm-agent"
+# Restore pre-built as-guestd
+if [ -n "$AS_GUESTD_PREBUILT" ]; then
+    mv "$AS_GUESTD_PREBUILT" "$BUILD_DIR/as-guestd"
 fi
 
 # ---------------------------------------------------------------
-# 1. Locate vm-agent binary
+# 1. Locate as-guestd binary
 # ---------------------------------------------------------------
-echo "==> Locating vm-agent binary..."
-if [ -f "$BUILD_DIR/vm-agent" ]; then
-    echo "    using pre-built: $BUILD_DIR/vm-agent"
+echo "==> Locating as-guestd binary..."
+if [ -f "$BUILD_DIR/as-guestd" ]; then
+    echo "    using pre-built: $BUILD_DIR/as-guestd"
 elif command -v go &>/dev/null; then
-    echo "    building vm-agent..."
-    VM_AGENT_SRC="$ROOT_DIR/vm-agent"
+    echo "    building as-guestd..."
+    AS_GUESTD_SRC="$ROOT_DIR/as-guestd"
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
         -ldflags="-s -w" \
-        -o "$BUILD_DIR/vm-agent" \
-        "$VM_AGENT_SRC/cmd/vm-agent/"
+        -o "$BUILD_DIR/as-guestd" \
+        "$AS_GUESTD_SRC/cmd/as-guestd/"
 else
-    echo "ERROR: vm-agent binary not found at $BUILD_DIR/vm-agent"
-    echo "       Build it first: GOOS=linux GOARCH=amd64 go build -o images/_build/vm-agent ./vm-agent/cmd/vm-agent/"
+    echo "ERROR: as-guestd binary not found at $BUILD_DIR/as-guestd"
+    echo "       Build it first: GOOS=linux GOARCH=amd64 go build -o images/_build/as-guestd ./as-guestd/cmd/as-guestd/"
     exit 1
 fi
-echo "    vm-agent: $(ls -lh "$BUILD_DIR/vm-agent" | awk '{print $5}')"
+echo "    as-guestd: $(ls -lh "$BUILD_DIR/as-guestd" | awk '{print $5}')"
 
 # ---------------------------------------------------------------
 # 2. Download Alpine minirootfs
@@ -119,7 +119,7 @@ sudo chroot "$ROOTFS_DIR" /bin/sh -c "
     # Auto-load virtiofs module
     echo 'virtiofs' >> /etc/modules
 
-    # Network: loopback only, vm-agent handles the rest
+    # Network: loopback only, as-guestd handles the rest
     mkdir -p /etc/network
     echo -e 'auto lo\niface lo inet loopback' > /etc/network/interfaces
 
@@ -146,29 +146,29 @@ sudo umount "$ROOTFS_DIR/proc" 2>/dev/null || true
 sudo umount "$ROOTFS_DIR/sys" 2>/dev/null || true
 sudo umount "$ROOTFS_DIR/dev" 2>/dev/null || true
 
-# Install vm-agent
-sudo cp "$BUILD_DIR/vm-agent" "$ROOTFS_DIR/usr/local/bin/vm-agent"
-sudo chmod +x "$ROOTFS_DIR/usr/local/bin/vm-agent"
+# Install as-guestd
+sudo cp "$BUILD_DIR/as-guestd" "$ROOTFS_DIR/usr/local/bin/as-guestd"
+sudo chmod +x "$ROOTFS_DIR/usr/local/bin/as-guestd"
 
 # OpenRC init script
-sudo tee "$ROOTFS_DIR/etc/init.d/vm-agent" > /dev/null <<'INITEOF'
+sudo tee "$ROOTFS_DIR/etc/init.d/as-guestd" > /dev/null <<'INITEOF'
 #!/sbin/openrc-run
 
-name="vm-agent"
-description="Agent Sandbox VM Agent"
-command="/usr/local/bin/vm-agent"
+name="as-guestd"
+description="Agent Sandbox Guest Daemon"
+command="/usr/local/bin/as-guestd"
 command_background="yes"
-pidfile="/run/vm-agent.pid"
-output_log="/var/log/vm-agent.log"
-error_log="/var/log/vm-agent.log"
+pidfile="/run/as-guestd.pid"
+output_log="/var/log/as-guestd.log"
+error_log="/var/log/as-guestd.log"
 
 depend() {
     need localmount
     after bootmisc
 }
 INITEOF
-sudo chmod +x "$ROOTFS_DIR/etc/init.d/vm-agent"
-sudo chroot "$ROOTFS_DIR" rc-update add vm-agent default
+sudo chmod +x "$ROOTFS_DIR/etc/init.d/as-guestd"
+sudo chroot "$ROOTFS_DIR" rc-update add as-guestd default
 
 # fstab
 sudo tee "$ROOTFS_DIR/etc/fstab" > /dev/null <<'FSTAB'

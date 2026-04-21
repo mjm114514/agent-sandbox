@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"syscall"
 
-	"github.com/anthropics/agent-sandbox/vm-agent/rpc"
+	"github.com/anthropics/agent-sandbox/as-guestd/rpc"
 )
 
 type StartParams struct {

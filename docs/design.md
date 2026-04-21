@@ -19,7 +19,7 @@ Inside the VM, multiple **environments** — each a bwrap-isolated, ephemeral us
 ┌──────────────────────────────────────────────────────────────┐
 │ Host                                                         │
 │                                                              │
-│  SDK (Python) ──stdio JSON-RPC──► sandboxd (Go)              │
+│  SDK (Python) ──stdio JSON-RPC──► as-hostd (Go)              │
 │                                       │                      │
 │                                       ├─ vm-manager          │
 │                                       ├─ netstack-svc        │
@@ -31,7 +31,7 @@ Inside the VM, multiple **environments** — each a bwrap-isolated, ephemeral us
 ┌───────────────────────────┼──────────────────────────────────┐
 │ VM (guest)                │                                  │
 │                           ▼                                  │
-│   vm-agent (vsock client → host)                             │
+│   as-guestd (vsock client → host)                            │
 │     ├─ tap-bridge       TAP ↔ vsock tunnel                   │
 │     ├─ env-manager      useradd / bwrap / cgroup             │
 │     ├─ exec-runner      spawn & stream processes             │
@@ -43,9 +43,9 @@ Inside the VM, multiple **environments** — each a bwrap-isolated, ephemeral us
 
 ### Components
 
-#### sandboxd (Go, runs on host)
+#### as-hostd (Go, runs on host)
 
-Single binary, spawned by the Python SDK as a child process. Communicates with the SDK over **stdin/stdout JSON-RPC 2.0**. Communicates with the guest vm-agent over **vsock JSON-RPC** (control plane) and a separate **vsock raw channel** (data plane for TAP frames).
+Single binary, spawned by the Python SDK as a child process. Communicates with the SDK over **stdin/stdout JSON-RPC 2.0**. Communicates with the guest as-guestd over **vsock JSON-RPC** (control plane) and a separate **vsock raw channel** (data plane for TAP frames).
 
 Sub-modules:
 
@@ -55,9 +55,9 @@ Sub-modules:
 | **netstack-svc** | Receives raw Ethernet frames from the guest TAP tunnel over vsock. Runs a full userspace TCP/IP stack using gVisor's `tcpip` and `stack` packages. For each outbound connection, performs a regular host-side `connect()` syscall, so the traffic inherits the host's network identity, DNS resolution, proxy settings, and TLS trust store. |
 | **mount-broker** | Exposes host directories into the guest via virtiofs (preferred) or 9p. Tracks which host paths are shared and their corresponding guest mount points, so that `Environment` and `Sandbox`-level mount requests can reference them. |
 
-#### vm-agent (Go, runs in guest)
+#### as-guestd (Go, runs in guest)
 
-Statically compiled binary, baked into the base VM image. Starts via systemd on boot. Connects to the host sandboxd over vsock.
+Statically compiled binary, baked into the base VM image. Starts via systemd on boot. Connects to the host as-hostd over vsock.
 
 Sub-modules:
 
@@ -75,21 +75,21 @@ Sub-modules:
 ```
 SDK (Python)
   ──stdio JSON-RPC──►
-    sandboxd (Go)
+    as-hostd (Go)
       ──vsock JSON-RPC──►
-        vm-agent (Go)
+        as-guestd (Go)
 ```
 
-All SDK operations (`Sandbox.start`, `sb.exec`, `env.exec`, `env.close`, etc.) are JSON-RPC calls over this path. sandboxd translates SDK-level calls into vm-agent RPCs where needed, and handles host-local operations (VM lifecycle, netstack) directly.
+All SDK operations (`Sandbox.start`, `sb.exec`, `env.exec`, `env.close`, etc.) are JSON-RPC calls over this path. as-hostd translates SDK-level calls into as-guestd RPCs where needed, and handles host-local operations (VM lifecycle, netstack) directly.
 
 ### Network Data Plane
 
 ```
 Guest process
   → kernel → TAP device
-    → vm-agent tap-bridge
+    → as-guestd tap-bridge
       → vsock (raw Ethernet frames, length-prefixed)
-        → sandboxd netstack-svc
+        → as-hostd netstack-svc
           → host-side connect() / sendto()
             → internet (as host process traffic)
 ```
@@ -260,10 +260,10 @@ asyncio.run(main())
 
 The base image is a minimal Linux (e.g., Alpine or Ubuntu minimal) shipping with:
 
-- **vm-agent** binary at `/usr/local/bin/vm-agent`, started by a systemd unit.
+- **as-guestd** binary at `/usr/local/bin/as-guestd`, started by a systemd unit.
 - **bubblewrap** (`bwrap`) installed.
 - **virtiofs** kernel support enabled.
-- A passwordless `sandbox-admin` user for vm-agent to run as, with sudo rights for `useradd`, `userdel`, `bwrap`, and `cgcreate`.
+- A passwordless `sandbox-admin` user for as-guestd to run as, with sudo rights for `useradd`, `userdel`, `bwrap`, and `cgcreate`.
 - No SSH, no unnecessary services.
 
 The image is intentionally minimal. Users extend the VM's capabilities at runtime by mounting host directories containing their binaries and configuration, then launching services via `Sandbox.exec()`. This avoids the need for custom image builds in most cases.
@@ -272,7 +272,7 @@ Image build tooling (Packer or a shell script) lives in `images/` in this repo.
 
 ## vsock Protocol
 
-The system uses multiple vsock connections between sandboxd and vm-agent. Port 1000 and 1001 are reserved for the control and data channels. Additional ports can be requested by the user for custom services.
+The system uses multiple vsock connections between as-hostd and as-guestd. Port 1000 and 1001 are reserved for the control and data channels. Additional ports can be requested by the user for custom services.
 
 ### Control Channel (CID=3, port 1000)
 
@@ -282,7 +282,7 @@ JSON-RPC 2.0 over a length-prefixed framing:
 [4-byte big-endian payload length][JSON-RPC message (UTF-8)]
 ```
 
-Methods exposed by vm-agent:
+Methods exposed by as-guestd:
 
 | Method | Params | Description |
 |---|---|---|
@@ -294,7 +294,7 @@ Methods exposed by vm-agent:
 | `mount.bind` | `{virtiofs_tag, guest_path}` | Mount a virtiofs share |
 | `mount.unbind` | `{guest_path}` | Unmount |
 
-Notifications from vm-agent to sandboxd (JSON-RPC notifications, no response expected):
+Notifications from as-guestd to as-hostd (JSON-RPC notifications, no response expected):
 
 | Notification | Params | Description |
 |---|---|---|
@@ -346,7 +346,7 @@ type VMBackend interface {
 ## Security Considerations
 
 - **Environments are not a security boundary.** They use Linux user isolation + bwrap namespaces. This prevents accidental cross-contamination between concurrent agent tasks but does not defend against a malicious guest process attempting privilege escalation. The VM boundary is the security boundary.
-- **Network traffic is re-originated on the host.** The guest has no direct network access. All connections are made by the sandboxd process on behalf of the guest, inheriting the host's network identity and policies. This means host-level firewalls, proxies, and monitoring apply to guest traffic automatically.
+- **Network traffic is re-originated on the host.** The guest has no direct network access. All connections are made by the as-hostd process on behalf of the guest, inheriting the host's network identity and policies. This means host-level firewalls, proxies, and monitoring apply to guest traffic automatically.
 
 ## Repository Layout
 
@@ -354,16 +354,16 @@ type VMBackend interface {
 agent-sandbox/
 ├── docs/
 │   └── design.md              # this document
-├── sandboxd/                   # Go module: host-side daemon
-│   ├── cmd/sandboxd/           # main entry point
+├── as-hostd/                   # Go module: host-side daemon
+│   ├── cmd/as-hostd/           # main entry point
 │   ├── vm/                     # VMBackend implementations
 │   │   ├── hcs/                # Windows HCS (Host Compute Service)
 │   │   └── avf/                # macOS Apple Virtualization Framework
 │   ├── netstack/               # gVisor netstack integration
 │   ├── mount/                  # virtiofs / 9p broker
 │   └── rpc/                    # JSON-RPC protocol types
-├── vm-agent/                   # Go module: guest-side agent
-│   ├── cmd/vm-agent/
+├── as-guestd/                  # Go module: guest-side daemon
+│   ├── cmd/as-guestd/
 │   ├── tap/
 │   ├── env/
 │   ├── exec/
