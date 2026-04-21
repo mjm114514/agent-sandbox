@@ -1,4 +1,4 @@
-# File Sharing with Guard
+# File Guard
 
 ## Motivation
 
@@ -8,11 +8,13 @@ file, corrupt a working tree. The sandbox's job is to make those
 mistakes **visible** (show what changed) and **reversible** (get the
 original back).
 
-Stock hypervisor shares (HCS Plan 9, AVF virtiofs) have no hook for
-this. We replace them with a self-hosted 9P server running in-process
-with `as-hostd`. The server is pass-through by default; a per-env
-**File Guard** feature backs up any file on first modification and
-exposes a change list to the SDK.
+Today, file sharing goes through the hypervisor's native 9P stack
+(HCS Plan 9 on Windows, AVF virtiofs on macOS). Those are black boxes
+— the host has no protocol-level visibility into what the guest does
+with shared directories. File Guard replaces that path with a
+self-hosted 9P server running in-process with `as-hostd`: pass-through
+by default, with a per-env opt-in that backs up any file on first
+modification and exposes a change list to the SDK.
 
 ## Threat Model
 

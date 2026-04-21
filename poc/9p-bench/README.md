@@ -2,7 +2,7 @@
 
 Measures 9P protocol + Linux kernel 9p-client overhead against the underlying
 filesystem, to decide whether to invest in a self-hosted 9P server for
-auditable file sharing.
+the File Guard feature (see `docs/file-guard.md`).
 
 ## What it measures
 
