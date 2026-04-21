@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/anthropics/agent-sandbox/sandboxd/netstack"
@@ -17,15 +18,23 @@ import (
 	"github.com/anthropics/agent-sandbox/sandboxd/vm/hcs"
 )
 
+type vmMount struct {
+	Tag       string
+	HostPath  string
+	GuestPath string
+}
+
 type daemon struct {
 	backend        vm.Backend
 	currentVM      vm.VM
 	agentConn      *rpc.Conn
 	sdk            *rpc.StdioServer
 	netSvc         *netstack.Service
+	mu             sync.Mutex
 	vsockStreams   map[int]net.Conn
 	nextStreamID   int
 	portForwarders map[int]net.Listener
+	vmMounts       []vmMount
 	status         string // "running", "degraded", "dead"
 	lastHeartbeat  time.Time
 }
@@ -51,8 +60,10 @@ func main() {
 }
 
 func (d *daemon) detectBackend() {
-	// Default boot dir: alongside the sandboxd binary
-	bootDir := filepath.Join(filepath.Dir(os.Args[0]), "boot")
+	bootDir := os.Getenv("SANDBOXD_BOOT_DIR")
+	if bootDir == "" {
+		bootDir = filepath.Join(filepath.Dir(os.Args[0]), "boot")
+	}
 	b := hcs.New(bootDir)
 	if b.Available() {
 		d.backend = b
@@ -87,7 +98,10 @@ func (d *daemon) handleSDKCall(method string, params json.RawMessage) (any, erro
 	case "env.export":
 		return d.envExport(params)
 	case "sandbox.status":
-		return map[string]any{"status": d.status}, nil
+		d.mu.Lock()
+		status := d.status
+		d.mu.Unlock()
+		return map[string]any{"status": status}, nil
 	default:
 		if d.agentConn == nil {
 			return nil, &rpc.Error{Code: -32601, Message: "vm-agent not connected"}
@@ -139,9 +153,10 @@ func (d *daemon) sandboxCreate(params json.RawMessage) (any, error) {
 		VSockPorts: p.VSockPorts,
 	}
 
-	for _, m := range p.Mounts {
+	for i, m := range p.Mounts {
+		tag := fmt.Sprintf("vm-mount-%d", i)
 		cfg.Mounts = append(cfg.Mounts, vm.SharedDir{
-			Tag:      m.GuestPath,
+			Tag:      tag,
 			HostPath: m.HostPath,
 		})
 	}
@@ -151,6 +166,17 @@ func (d *daemon) sandboxCreate(params json.RawMessage) (any, error) {
 		return nil, fmt.Errorf("create vm: %w", err)
 	}
 	d.currentVM = v
+
+	// Record VM-level mounts to be shared+bound after VM start
+	d.vmMounts = nil
+	for i, m := range p.Mounts {
+		tag := fmt.Sprintf("vm-mount-%d", i)
+		d.vmMounts = append(d.vmMounts, vmMount{
+			Tag:       tag,
+			HostPath:  m.HostPath,
+			GuestPath: m.GuestPath,
+		})
+	}
 
 	return map[string]any{"id": v.ID()}, nil
 }
@@ -212,6 +238,21 @@ func (d *daemon) sandboxStart() (any, error) {
 		return nil, fmt.Errorf("timeout waiting for vm-agent to connect — VM may have failed to boot. Check if hv_sock module is available in the guest kernel")
 	}
 
+	// Share and bind VM-level mounts
+	for _, m := range d.vmMounts {
+		if err := d.currentVM.ShareDir(m.Tag, m.HostPath); err != nil {
+			return nil, fmt.Errorf("share dir %s: %w", m.HostPath, err)
+		}
+		_, err := d.agentConn.Call("mount.bind", map[string]string{
+			"virtiofs_tag": m.Tag,
+			"guest_path":   m.GuestPath,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("mount.bind %s: %w", m.GuestPath, err)
+		}
+		log.Printf("mounted %s -> %s (tag=%s)", m.HostPath, m.GuestPath, m.Tag)
+	}
+
 	return map[string]any{"ok": true}, nil
 }
 
@@ -226,8 +267,11 @@ func (d *daemon) setupAgent(controlConn, dataConn net.Conn) {
 		for notif := range d.agentConn.Notifications {
 			switch notif.Method {
 			case "heartbeat.ping":
+				d.mu.Lock()
 				d.lastHeartbeat = time.Now()
-				if d.status == "degraded" {
+				status := d.status
+				d.mu.Unlock()
+				if status == "degraded" {
 					d.setStatus("running", "heartbeat recovered")
 				}
 			case "log":
@@ -369,9 +413,11 @@ func (d *daemon) vsockConnect(params json.RawMessage) (any, error) {
 		return nil, fmt.Errorf("vsock accept port %d: %w", p.Port, err)
 	}
 
+	d.mu.Lock()
 	d.nextStreamID++
 	streamID := d.nextStreamID
 	d.vsockStreams[streamID] = conn
+	d.mu.Unlock()
 
 	go d.vsockReadLoop(streamID, conn)
 
@@ -396,7 +442,9 @@ func (d *daemon) vsockReadLoop(streamID int, conn net.Conn) {
 				Method: "vsock.closed",
 				Params: mustMarshal(map[string]any{"stream_id": streamID}),
 			})
+			d.mu.Lock()
 			delete(d.vsockStreams, streamID)
+			d.mu.Unlock()
 			return
 		}
 	}
@@ -410,7 +458,9 @@ func (d *daemon) vsockWrite(params json.RawMessage) (any, error) {
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
+	d.mu.Lock()
 	conn, ok := d.vsockStreams[p.StreamID]
+	d.mu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("stream %d not found", p.StreamID)
 	}
@@ -432,12 +482,15 @@ func (d *daemon) vsockClose(params json.RawMessage) (any, error) {
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
+	d.mu.Lock()
 	conn, ok := d.vsockStreams[p.StreamID]
 	if !ok {
+		d.mu.Unlock()
 		return nil, fmt.Errorf("stream %d not found", p.StreamID)
 	}
-	conn.Close()
 	delete(d.vsockStreams, p.StreamID)
+	d.mu.Unlock()
+	conn.Close()
 	return map[string]any{"ok": true}, nil
 }
 
@@ -450,15 +503,19 @@ func (d *daemon) networkForward(params json.RawMessage) (any, error) {
 		return nil, err
 	}
 
+	d.mu.Lock()
 	if _, ok := d.portForwarders[p.HostPort]; ok {
+		d.mu.Unlock()
 		return nil, fmt.Errorf("host port %d already forwarded", p.HostPort)
 	}
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p.HostPort))
 	if err != nil {
+		d.mu.Unlock()
 		return nil, fmt.Errorf("listen on host port %d: %w", p.HostPort, err)
 	}
 	d.portForwarders[p.HostPort] = ln
+	d.mu.Unlock()
 
 	guestAddr := fmt.Sprintf("10.0.2.1:%d", p.GuestPort)
 	go func() {
@@ -499,7 +556,9 @@ func (d *daemon) networkExpose(params json.RawMessage) (any, error) {
 		return nil, err
 	}
 	hostPort := ln.Addr().(*net.TCPAddr).Port
+	d.mu.Lock()
 	d.portForwarders[hostPort] = ln
+	d.mu.Unlock()
 
 	guestAddr := fmt.Sprintf("10.0.2.1:%d", p.GuestPort)
 	go func() {
@@ -540,31 +599,52 @@ func (d *daemon) envExport(params json.RawMessage) (any, error) {
 		return nil, fmt.Errorf("vm-agent not connected")
 	}
 
-	result, err := d.agentConn.Call("env.export", map[string]string{
-		"name":       p.Name,
-		"guest_path": p.GuestPath,
-	})
+	f, err := os.Create(p.HostPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create host file %s: %w", p.HostPath, err)
+	}
+	defer f.Close()
+
+	var offset int64
+	var totalSize int64
+	for {
+		result, err := d.agentConn.Call("env.export", map[string]any{
+			"name":       p.Name,
+			"guest_path": p.GuestPath,
+			"offset":     offset,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		var resp struct {
+			DataB64   string `json:"data_b64"`
+			TotalSize int64  `json:"total_size"`
+			Offset    int64  `json:"offset"`
+			EOF       bool   `json:"eof"`
+		}
+		if err := json.Unmarshal(*result, &resp); err != nil {
+			return nil, err
+		}
+		totalSize = resp.TotalSize
+
+		if resp.DataB64 != "" {
+			data, err := base64.StdEncoding.DecodeString(resp.DataB64)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := f.Write(data); err != nil {
+				return nil, fmt.Errorf("write to host %s: %w", p.HostPath, err)
+			}
+			offset += int64(len(data))
+		}
+
+		if resp.EOF {
+			break
+		}
 	}
 
-	var resp struct {
-		DataB64 string `json:"data_b64"`
-	}
-	if err := json.Unmarshal(*result, &resp); err != nil {
-		return nil, err
-	}
-
-	data, err := base64.StdEncoding.DecodeString(resp.DataB64)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := os.WriteFile(p.HostPath, data, 0644); err != nil {
-		return nil, fmt.Errorf("write to host %s: %w", p.HostPath, err)
-	}
-
-	return map[string]any{"ok": true, "size": len(data)}, nil
+	return map[string]any{"ok": true, "size": totalSize}, nil
 }
 
 func mustMarshal(v any) json.RawMessage {
@@ -576,25 +656,31 @@ func (d *daemon) heartbeatMonitor() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		if d.status == "dead" {
+		d.mu.Lock()
+		status := d.status
+		elapsed := time.Since(d.lastHeartbeat)
+		d.mu.Unlock()
+
+		if status == "dead" {
 			return
 		}
-		elapsed := time.Since(d.lastHeartbeat)
-		if elapsed > 60*time.Second && d.status != "dead" {
+		if elapsed > 60*time.Second && status != "dead" {
 			d.setStatus("dead", "no heartbeat for 60s, VM presumed crashed")
 			if d.currentVM != nil {
 				d.currentVM.Destroy()
 			}
 			return
 		}
-		if elapsed > 15*time.Second && d.status == "running" {
+		if elapsed > 15*time.Second && status == "running" {
 			d.setStatus("degraded", "no heartbeat for 15s")
 		}
 	}
 }
 
 func (d *daemon) setStatus(status, reason string) {
+	d.mu.Lock()
 	d.status = status
+	d.mu.Unlock()
 	log.Printf("sandbox status: %s (%s)", status, reason)
 	d.sdk.ForwardNotification(&rpc.Message{
 		Method: "sandbox.status",

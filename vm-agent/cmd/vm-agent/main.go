@@ -177,19 +177,18 @@ func serve(conn net.Conn) {
 			var p struct {
 				Name      string `json:"name"`
 				GuestPath string `json:"guest_path"`
+				Offset    int64  `json:"offset"`
+				ChunkSize int    `json:"chunk_size"`
 			}
 			if err := json.Unmarshal(msg.Params, &p); err != nil {
 				rpcErr = fmt.Errorf("parse params: %w", err)
 				break
 			}
-			data, err := readFileFromGuest(p.GuestPath)
-			if err != nil {
-				rpcErr = err
-			} else {
-				result = map[string]any{
-					"data_b64": base64.StdEncoding.EncodeToString(data),
-				}
+			chunkSize := p.ChunkSize
+			if chunkSize <= 0 || chunkSize > 1024*1024 {
+				chunkSize = 512 * 1024
 			}
+			result, rpcErr = readFileChunk(p.GuestPath, p.Offset, chunkSize)
 
 		case "mount.bind":
 			var p vmmount.BindParams
@@ -233,8 +232,45 @@ func serve(conn net.Conn) {
 	}
 }
 
-func readFileFromGuest(path string) ([]byte, error) {
-	return os.ReadFile(path)
+func readFileChunk(path string, offset int64, chunkSize int) (map[string]any, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	totalSize := info.Size()
+
+	if offset >= totalSize {
+		return map[string]any{
+			"data_b64":   "",
+			"total_size": totalSize,
+			"offset":     offset,
+			"eof":        true,
+		}, nil
+	}
+
+	if _, err := f.Seek(offset, 0); err != nil {
+		return nil, err
+	}
+
+	buf := make([]byte, chunkSize)
+	n, err := f.Read(buf)
+	if err != nil && err.Error() != "EOF" {
+		return nil, err
+	}
+
+	eof := offset+int64(n) >= totalSize
+	return map[string]any{
+		"data_b64":   base64.StdEncoding.EncodeToString(buf[:n]),
+		"total_size": totalSize,
+		"offset":     offset,
+		"eof":        eof,
+	}, nil
 }
 
 func heartbeat(rc *rpc.Conn) {

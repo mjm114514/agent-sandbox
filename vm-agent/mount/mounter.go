@@ -32,7 +32,7 @@ func (m *Mounter) Bind(params BindParams) error {
 		return fmt.Errorf("mkdir %s: %s: %w", params.GuestPath, out, err)
 	}
 
-	out, err := exec.Command("mount", "-t", "virtiofs", params.VirtiofsTag, params.GuestPath).CombinedOutput()
+	out, err := exec.Command("mount", "-t", "9p", params.VirtiofsTag, params.GuestPath, "-o", "trans=virtio,version=9p2000.L").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("mount virtiofs %s: %s: %w", params.VirtiofsTag, out, err)
 	}

@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -29,6 +28,7 @@ var (
 	procHcsCloseOperation                 = computecore.NewProc("HcsCloseOperation")
 	procHcsWaitForOperationResult         = computecore.NewProc("HcsWaitForOperationResult")
 	procHcsGetComputeSystemProperties     = computecore.NewProc("HcsGetComputeSystemProperties")
+	procHcsModifyComputeSystem            = computecore.NewProc("HcsModifyComputeSystem")
 )
 
 var _ vmapi.VM = (*hcsVM)(nil)
@@ -214,28 +214,42 @@ func (v *hcsVM) Start() error {
 }
 
 func (v *hcsVM) getRuntimeID() guid.GUID {
-	out, err := exec.Command("hcsdiag.exe", "list").Output()
-	if err != nil {
-		log.Printf("hcsdiag list failed: %v", err)
+	query, _ := syscall.UTF16PtrFromString(`{"PropertyTypes":["RuntimeId"]}`)
+
+	op := createOperation()
+	defer closeOperation(op)
+
+	var resultDoc *uint16
+	r1, _, _ := procHcsGetComputeSystemProperties.Call(
+		uintptr(v.handle),
+		op,
+		uintptr(unsafe.Pointer(query)),
+		uintptr(unsafe.Pointer(&resultDoc)),
+	)
+	if r1 != 0 {
+		log.Printf("HcsGetComputeSystemProperties: HRESULT 0x%08x: %s", r1, readUTF16Ptr(resultDoc))
 		return guid.GUID{}
 	}
-	lines := strings.Split(string(out), "\n")
-	for i, line := range lines {
-		if strings.TrimSpace(line) == v.id && i+1 < len(lines) {
-			nextLine := lines[i+1]
-			parts := strings.Split(nextLine, ",")
-			for _, p := range parts {
-				p = strings.TrimSpace(p)
-				if len(p) == 36 && p[8] == '-' {
-					if g, err := guid.FromString(p); err == nil {
-						return g
-					}
-				}
-			}
-		}
+
+	if err := waitForOperation(op, 10000); err != nil {
+		log.Printf("HcsGetComputeSystemProperties wait: %v", err)
+		return guid.GUID{}
 	}
-	log.Printf("VM GUID not found for %s", v.id)
-	return guid.GUID{}
+
+	var props struct {
+		RuntimeId string `json:"RuntimeId"`
+	}
+	if err := json.Unmarshal([]byte(readUTF16Ptr(resultDoc)), &props); err != nil {
+		log.Printf("parse compute system properties: %v", err)
+		return guid.GUID{}
+	}
+
+	g, err := guid.FromString(props.RuntimeId)
+	if err != nil {
+		log.Printf("parse RuntimeId GUID %q: %v", props.RuntimeId, err)
+		return guid.GUID{}
+	}
+	return g
 }
 
 func (v *hcsVM) Stop() error {
@@ -283,11 +297,56 @@ func (v *hcsVM) VSockListen(port uint32) (net.Listener, error) {
 }
 
 func (v *hcsVM) ShareDir(tag string, hostPath string) error {
-	// Plan 9 shares are added via HCS modify request.
-	// For now, a simple implementation using the Scsi path.
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.shares[tag] = hostPath
+
+	absPath, err := filepath.Abs(hostPath)
+	if err != nil {
+		return fmt.Errorf("abs path %s: %w", hostPath, err)
+	}
+
+	modifyReq := map[string]any{
+		"ResourcePath": "VirtualMachine/Devices/Plan9/Shares",
+		"RequestType":  "Add",
+		"Settings": map[string]any{
+			"Name":      tag,
+			"Path":      absPath,
+			"Port":      0,
+			"ReadOnly":  false,
+			"UseShareRootIdentity": false,
+			"AllowedFiles":         []string{},
+		},
+	}
+
+	reqBytes, err := json.Marshal(modifyReq)
+	if err != nil {
+		return fmt.Errorf("marshal modify request: %w", err)
+	}
+
+	reqUTF16, err := syscall.UTF16PtrFromString(string(reqBytes))
+	if err != nil {
+		return err
+	}
+
+	op := createOperation()
+	defer closeOperation(op)
+
+	var resultDoc *uint16
+	r1, _, _ := procHcsModifyComputeSystem.Call(
+		uintptr(v.handle),
+		op,
+		uintptr(unsafe.Pointer(reqUTF16)),
+		uintptr(unsafe.Pointer(&resultDoc)),
+	)
+	if r1 != 0 {
+		return fmt.Errorf("HcsModifyComputeSystem (Plan9 share %s): HRESULT 0x%08x: %s", tag, r1, readUTF16Ptr(resultDoc))
+	}
+
+	if err := waitForOperation(op, 30000); err != nil {
+		return fmt.Errorf("HcsModifyComputeSystem wait: %w", err)
+	}
+
+	v.shares[tag] = absPath
 	return nil
 }
 
