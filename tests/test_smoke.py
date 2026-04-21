@@ -8,13 +8,14 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sdk"))
 
+from sandbox._binary import find_sandboxd
 from sandbox._rpc import RpcConn, RpcError
 
 
 async def test_stdio_rpc():
     """Test that sandboxd responds to JSON-RPC calls over stdio."""
     proc = await asyncio.create_subprocess_exec(
-        os.path.join(os.path.dirname(__file__), "..", "sandboxd", "sandboxd.exe"),
+        find_sandboxd(),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

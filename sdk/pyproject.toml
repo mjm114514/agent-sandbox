@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-sandbox"
+version = "0.1.0"
+description = "Local VM-based sandbox for AI agents with transparent host networking"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+
+[project.urls]
+Repository = "https://github.com/mjm114514/agent-sandbox"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sandbox*"]
+
+[tool.setuptools.package-data]
+sandbox = ["_bin/*"]

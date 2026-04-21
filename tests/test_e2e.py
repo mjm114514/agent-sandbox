@@ -8,8 +8,9 @@ import json
 import sys
 import base64
 
-SANDBOXD = os.path.join(os.path.dirname(__file__), "..", "sandboxd", "sandboxd.exe")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sdk"))
+from sandbox._binary import find_sandboxd
+SANDBOXD = find_sandboxd()
 
 
 class SimpleRPC:

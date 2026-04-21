@@ -4,6 +4,7 @@ import asyncio
 import sys
 from typing import Literal
 
+from sandbox._binary import find_sandboxd
 from sandbox._rpc import RpcConn
 from sandbox.environment import Environment
 from sandbox.network import Mount, Network
@@ -81,8 +82,9 @@ class Sandbox:
         mounts: list[Mount] | None = None,
         vsock_ports: list[int] | None = None,
     ) -> Sandbox:
+        sandboxd_path = find_sandboxd()
         proc = await asyncio.create_subprocess_exec(
-            "sandboxd",
+            sandboxd_path,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=sys.stderr,
