@@ -12,6 +12,9 @@ license = {text = "MIT"}
 [project.urls]
 Repository = "https://github.com/mjm114514/agent-sandbox"
 
+[project.scripts]
+sandbox = "sandbox.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["sandbox*"]

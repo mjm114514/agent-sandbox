@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from typing import Literal
 
 from sandbox._binary import find_sandboxd
 from sandbox._rpc import RpcConn
+from sandbox.boot import find_boot_dir
 from sandbox.environment import Environment
 from sandbox.network import Mount, Network
 from sandbox.process import Process
@@ -83,11 +85,16 @@ class Sandbox:
         vsock_ports: list[int] | None = None,
     ) -> Sandbox:
         sandboxd_path = find_sandboxd()
+        env = dict(os.environ)
+        boot_dir = find_boot_dir()
+        if boot_dir is not None:
+            env["SANDBOXD_BOOT_DIR"] = str(boot_dir)
         proc = await asyncio.create_subprocess_exec(
             sandboxd_path,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=sys.stderr,
+            env=env,
         )
 
         reader = proc.stdout

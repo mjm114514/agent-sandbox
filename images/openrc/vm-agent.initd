@@ -1,0 +1,14 @@
+#!/sbin/openrc-run
+
+name="vm-agent"
+description="Agent Sandbox VM Agent"
+command="/usr/local/bin/vm-agent"
+command_background="yes"
+pidfile="/run/vm-agent.pid"
+output_log="/var/log/vm-agent.log"
+error_log="/var/log/vm-agent.log"
+
+depend() {
+    need localmount
+    after bootmisc
+}
