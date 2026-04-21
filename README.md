@@ -4,37 +4,17 @@ Local VM-based sandbox for AI agents with transparent host networking.
 
 All network traffic from the VM is re-originated by the host process, so it inherits the host's DNS, proxy settings, TLS trust store, and network identity — no VM enrollment required in enterprise environments.
 
-## Architecture
+For architecture and design rationale, see [docs/design.md](docs/design.md).
 
-```
-┌─────────────────────────────────────────────────────────┐
-│ Host                                                     │
-│                                                          │
-│  SDK (Python) ──stdio JSON-RPC──► sandboxd (Go)          │
-│                                       │                  │
-│                                       ├─ vm-manager      │
-│                                       ├─ netstack-svc    │
-│                                       └─ mount-broker    │
-│                                       │                  │
-│                          vsock ◄──────┘                  │
-└───────────────────────────┼──────────────────────────────┘
-                            │
-┌───────────────────────────┼──────────────────────────────┐
-│ VM (guest)                │                              │
-│                           ▼                              │
-│   vm-agent (vsock → host)                                │
-│     ├─ tap-bridge       TAP ↔ vsock tunnel               │
-│     ├─ env-manager      useradd / bwrap / cgroup         │
-│     ├─ exec-runner      spawn & stream processes         │
-│     └─ mount-mounter    virtiofs shares into bwrap       │
-│                                                          │
-│   [user-defined services via mount + exec + vsock]       │
-└──────────────────────────────────────────────────────────┘
-```
+## Features
 
-**sandboxd** creates a lightweight Linux VM via HCS (Windows) or AVF (macOS), connects to the in-guest **vm-agent** over Hyper-V sockets, and forwards all network traffic through a gVisor userspace TCP/IP stack that re-originates connections as host syscalls.
-
-Inside the VM, multiple **environments** — each an ephemeral user isolated with bubblewrap — give agents cheap, disposable workspaces without spinning up additional VMs.
+- **One-VM-per-app model.** A single long-lived VM hosts many cheap, disposable agent workspaces.
+- **Transparent networking.** Guest traffic exits through the host's network stack — DNS, proxy, TLS trust all inherited automatically.
+- **Fast environments.** Per-agent isolation via `useradd` + bubblewrap + cgroups; no VM reboot between tasks.
+- **Mount host directories** into the VM or into a specific environment, read-only or read-write.
+- **Streaming process I/O** for stdout, stderr, stdin, signals, and exit codes.
+- **Vsock ports** for direct host↔guest communication to build custom services (proxies, credential brokers, etc.).
+- **Python SDK** with `asyncio` API; Go daemon (`sandboxd`) + in-guest agent (`vm-agent`).
 
 ## Quick Start
 
@@ -104,11 +84,11 @@ cd sdk
 pip install -e .
 ```
 
-## Key Concepts
+## SDK Usage
 
 ### Sandbox
 
-A single VM. Created explicitly, one per application. Owns the network stack and VM lifecycle.
+A single VM. Created explicitly, one per application.
 
 ```python
 sb = await Sandbox.create(vcpus=4, mem="8G", vsock_ports=[2000])
@@ -117,7 +97,7 @@ await sb.start()
 
 ### Environment
 
-A bwrap-isolated workspace inside the VM. Each environment gets its own Linux user, mount namespace, and optional cgroup limits. Creating and destroying environments is fast — no VM boot required.
+An isolated workspace inside the VM. Each environment gets its own Linux user, mount namespace, and optional cgroup limits.
 
 ```python
 async with await sb.environment(
@@ -133,7 +113,7 @@ async with await sb.environment(
 
 ### Process
 
-A running command inside a Sandbox (VM-level) or Environment. Supports streaming stdout/stderr, stdin writes, signals, and exit code retrieval.
+A running command inside a Sandbox (VM-level) or Environment.
 
 ```python
 proc = await env.exec(["long-running-task"], stream=True)
@@ -142,19 +122,7 @@ async for line in proc.stdout_stream():
 code = await proc.wait()
 ```
 
-### Transparent Networking
-
-All guest network traffic flows through: guest kernel → TAP device → vsock tunnel → host gVisor netstack → host `connect()` syscall. The host's network stack handles DNS resolution, proxy settings, and TLS — the guest needs no configuration.
-
-### Extensibility
-
-The sandbox provides three composable primitives for building higher-level features:
-
-- **Mounts**: share host directories into the VM (`Mount("/host/tools", "/opt/tools")`)
-- **VM-level exec**: run services outside any environment (`sb.exec(["my-proxy"])`)
-- **Vsock ports**: direct host↔guest communication channels (`sb.vsock_connect(2000)`)
-
-For example, to add credential injection via a custom MITM proxy:
+### Custom services via mount + exec + vsock
 
 ```python
 sb = await Sandbox.create(
@@ -163,10 +131,10 @@ sb = await Sandbox.create(
 )
 await sb.start()
 
-# Start the proxy inside the VM
+# Start a service inside the VM
 await sb.exec(["/opt/proxy/bin/start", "--vsock-port=2000"])
 
-# Feed credentials from the host
+# Talk to it from the host
 async with await sb.vsock_connect(2000) as stream:
     await stream.write(json.dumps({"token": my_token}).encode())
 ```
@@ -175,20 +143,10 @@ async with await sb.vsock_connect(2000) as stream:
 
 ```
 agent-sandbox/
-├── docs/design.md          Design document
+├── docs/                   Design documents
 ├── sandboxd/               Host-side daemon (Go)
-│   ├── cmd/sandboxd/       Entry point
-│   ├── vm/                 VM backend (HCS)
-│   ├── netstack/           gVisor TCP/IP stack
-│   └── rpc/                JSON-RPC protocol
 ├── vm-agent/               Guest-side agent (Go)
-│   ├── cmd/vm-agent/       Entry point
-│   ├── tap/                TAP ↔ vsock bridge
-│   ├── env/                Environment manager
-│   ├── exec/               Process runner
-│   └── mount/              virtiofs mounter
 ├── sdk/                    Python SDK
-│   └── sandbox/
 ├── images/                 VM image build scripts
 └── tests/                  Integration tests
 ```
@@ -203,4 +161,7 @@ Working end-to-end on Windows (HCS backend). The following is verified:
 - Environment isolation (per-user + bwrap namespaces)
 - Network forwarding through gVisor netstack
 
-See [docs/design.md](docs/design.md) for the full design document.
+## Documentation
+
+- [docs/design.md](docs/design.md) — architecture, components, design principles
+- [docs/error-recovery.md](docs/error-recovery.md) — heartbeat, failure detection, logging
