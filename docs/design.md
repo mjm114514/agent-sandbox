@@ -57,7 +57,7 @@ Sub-modules:
 
 #### as-guestd (Go, runs in guest)
 
-Statically compiled binary, baked into the base VM image. Starts via systemd on boot. Connects to the host as-hostd over vsock.
+Statically compiled binary, baked into the base VM image. Started by OpenRC on boot. Connects to the host as-hostd over vsock.
 
 Sub-modules:
 
@@ -260,7 +260,7 @@ asyncio.run(main())
 
 The base image is a minimal Linux (e.g., Alpine or Ubuntu minimal) shipping with:
 
-- **as-guestd** binary at `/usr/local/bin/as-guestd`, started by a systemd unit.
+- **as-guestd** binary at `/usr/local/bin/as-guestd`, started by an OpenRC service.
 - **bubblewrap** (`bwrap`) installed.
 - **virtiofs** kernel support enabled.
 - A passwordless `sandbox-admin` user for as-guestd to run as, with sudo rights for `useradd`, `userdel`, `bwrap`, and `cgcreate`.
@@ -288,11 +288,14 @@ Methods exposed by as-guestd:
 |---|---|---|
 | `env.create` | `{name, mounts, env, cwd, cpu_limit, mem_limit}` | Create environment |
 | `env.close` | `{name}` | Tear down environment |
+| `env.export` | `{name, guest_path, offset, chunk_size}` | Read a file chunk from the guest. Returns `{data_b64, total_size, offset, eof}` |
 | `exec.start` | `{env?, argv, env_vars, cwd, timeout}` | Start a process. If `env` is omitted, runs at VM level as `sandbox-admin`. Returns `{pid}` |
 | `exec.write` | `{pid, data_b64}` | Write to stdin |
+| `exec.close_stdin` | `{pid}` | Close stdin |
 | `exec.kill` | `{pid, signal}` | Send signal |
 | `mount.bind` | `{virtiofs_tag, guest_path}` | Mount a virtiofs share |
 | `mount.unbind` | `{guest_path}` | Unmount |
+| `log.subscribe` | `{min_level}` | Enable log forwarding at or above `min_level` |
 
 Notifications from as-guestd to as-hostd (JSON-RPC notifications, no response expected):
 
@@ -301,6 +304,8 @@ Notifications from as-guestd to as-hostd (JSON-RPC notifications, no response ex
 | `exec.stdout` | `{pid, data_b64}` | stdout chunk |
 | `exec.stderr` | `{pid, data_b64}` | stderr chunk |
 | `exec.exit` | `{pid, code}` | Process exited |
+| `heartbeat.ping` | `{ts}` | Liveness ping (every 5s) |
+| `log` | `{level, msg, ts}` | Structured log line (only after `log.subscribe`) |
 
 ### Data Channel (CID=3, port 1001)
 
@@ -353,31 +358,38 @@ type VMBackend interface {
 ```
 agent-sandbox/
 ├── docs/
-│   └── design.md              # this document
-├── as-hostd/                   # Go module: host-side daemon
-│   ├── cmd/as-hostd/           # main entry point
-│   ├── vm/                     # VMBackend implementations
-│   │   ├── hcs/                # Windows HCS (Host Compute Service)
-│   │   └── avf/                # macOS Apple Virtualization Framework
-│   ├── netstack/               # gVisor netstack integration
-│   ├── mount/                  # virtiofs / 9p broker
-│   └── rpc/                    # JSON-RPC protocol types
-├── as-guestd/                  # Go module: guest-side daemon
+│   ├── design.md                # this document
+│   └── error-recovery.md        # heartbeat, failure detection, logging
+├── as-hostd/                    # Go module: host-side daemon
+│   ├── cmd/as-hostd/            # main entry point
+│   ├── vm/                      # VMBackend interface + implementations
+│   │   └── hcs/                 # Windows HCS (macOS AVF: TODO)
+│   ├── netstack/                # gVisor netstack integration
+│   └── rpc/                     # JSON-RPC framing + stdio server
+├── as-guestd/                   # Go module: guest-side daemon
 │   ├── cmd/as-guestd/
-│   ├── tap/
-│   ├── env/
-│   ├── exec/
-│   └── mount/
-├── sdk/                        # Python SDK
+│   ├── tap/                     # TAP device + vsock tunnel
+│   ├── env/                     # useradd / bwrap / cgroup manager
+│   ├── exec/                    # process runner, stdio streaming
+│   ├── mount/                   # virtiofs / 9p bind helper
+│   ├── log/                     # structured logger
+│   └── rpc/                     # JSON-RPC framing
+├── sdk/                         # Python SDK
 │   └── sandbox/
 │       ├── __init__.py
-│       ├── sandbox.py
-│       ├── environment.py
-│       ├── process.py
-│       ├── network.py
-│       └── _rpc.py             # JSON-RPC over stdio
-├── images/                     # VM image build scripts
-│   ├── Makefile
-│   └── base/
+│       ├── sandbox.py           # Sandbox class
+│       ├── environment.py       # Environment class
+│       ├── process.py           # Process class
+│       ├── network.py           # port forwarding / expose
+│       ├── _rpc.py              # JSON-RPC over stdio
+│       ├── _binary.py           # locate the as-hostd binary
+│       ├── boot.py              # VM boot file pull/build/cache
+│       ├── build.py             # build as-hostd from source
+│       └── cli.py               # `sandbox` CLI entry point
+├── images/                      # VM image build
+│   ├── Dockerfile               # reproducible image build
+│   ├── build-wsl.sh             # WSL-side direct build
+│   ├── etc/                     # static rootfs config (fstab, ...)
+│   └── openrc/                  # OpenRC init scripts
 └── tests/
 ```

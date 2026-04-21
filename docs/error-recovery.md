@@ -123,20 +123,3 @@ If the HCS VM exits unexpectedly (kernel panic, OOM kill):
 3. as-hostd sends `sandbox.status` notification with the reason.
 4. Subsequent RPC calls return clear errors.
 
-## Implementation Plan
-
-### as-guestd changes
-- Add heartbeat goroutine: sends `heartbeat.ping` every 5s on the control channel.
-- Add `log.subscribe` RPC handler.
-- Add structured logging helper that writes to both file and control channel.
-
-### as-hostd changes
-- Add heartbeat monitor goroutine: tracks last ping time, manages state transitions.
-- Forward `sandbox.status` and `sandbox.log` notifications to SDK.
-- Add `sandbox.status` RPC method for polling.
-
-### SDK changes
-- Add `Sandbox.status` property and `on_status()` / `on_log()` callback registration.
-- Add `RpcTimeoutError` with configurable timeout.
-- Add `export_logs()` method.
-- Handle connection loss gracefully in `_read_loop`.

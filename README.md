@@ -49,7 +49,7 @@ asyncio.run(main())
 
 - **Windows**: Hyper-V enabled, admin privileges
 - **macOS**: Apple Silicon (AVF support) — *not yet implemented*
-- **Go 1.21+** (for building as-hostd and as-guestd)
+- **Go 1.26+** (for building as-hostd and as-guestd)
 - **Python 3.12+** (for the SDK)
 - **WSL2 with Ubuntu** (for building the VM image on Windows)
 
