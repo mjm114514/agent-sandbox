@@ -22,43 +22,19 @@ ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
 ALPINE_MINIROOTFS_URL="$ALPINE_MIRROR/v$ALPINE_VERSION/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz"
 DISK_SIZE_MB=2048
 
-# Preserve pre-built as-guestd if it exists
-AS_GUESTD_PREBUILT=""
-if [ -f "$BUILD_DIR/as-guestd" ]; then
-    AS_GUESTD_PREBUILT="$(mktemp)"
-    cp "$BUILD_DIR/as-guestd" "$AS_GUESTD_PREBUILT"
-fi
-
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
 
-# Restore pre-built as-guestd
-if [ -n "$AS_GUESTD_PREBUILT" ]; then
-    mv "$AS_GUESTD_PREBUILT" "$BUILD_DIR/as-guestd"
-fi
+# NOTE: as-guestd is no longer embedded in the base rootfs. It rides on
+# a separate as-guestpack.vhdx built by build-guestpack-wsl.sh and
+# attached as the second SCSI disk. The base image carries a bootstrap
+# OpenRC service (images/openrc/as-guestd.initd) that mounts the
+# guestpack disk at /opt/as-guestpack and execs
+# /opt/as-guestpack/as-guestd. Rebuild this rootfs only when OS-level
+# deps change — not on every guestd iteration.
 
 # ---------------------------------------------------------------
-# 1. Locate as-guestd binary
-# ---------------------------------------------------------------
-echo "==> Locating as-guestd binary..."
-if [ -f "$BUILD_DIR/as-guestd" ]; then
-    echo "    using pre-built: $BUILD_DIR/as-guestd"
-elif command -v go &>/dev/null; then
-    echo "    building as-guestd..."
-    AS_GUESTD_SRC="$ROOT_DIR/as-guestd"
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-        -ldflags="-s -w" \
-        -o "$BUILD_DIR/as-guestd" \
-        "$AS_GUESTD_SRC/cmd/as-guestd/"
-else
-    echo "ERROR: as-guestd binary not found at $BUILD_DIR/as-guestd"
-    echo "       Build it first: GOOS=linux GOARCH=amd64 go build -o images/_build/as-guestd ./as-guestd/cmd/as-guestd/"
-    exit 1
-fi
-echo "    as-guestd: $(ls -lh "$BUILD_DIR/as-guestd" | awk '{print $5}')"
-
-# ---------------------------------------------------------------
-# 2. Download Alpine minirootfs
+# 1. Download Alpine minirootfs
 # ---------------------------------------------------------------
 ROOTFS_TAR="$BUILD_DIR/alpine-minirootfs.tar.gz"
 echo "==> Downloading Alpine minirootfs..."
@@ -116,8 +92,13 @@ sudo chroot "$ROOTFS_DIR" /bin/sh -c "
     sed -i 's/^#ttyS0/ttyS0/' /etc/inittab 2>/dev/null || true
     echo 'ttyS0::respawn:/sbin/getty -L ttyS0 115200 vt100' >> /etc/inittab
 
-    # Auto-load virtiofs module
+    # Kernel modules: 9p + 9pnet are needed for trans=fd mounts from the
+    # host 9P file-share server over vsock. virtiofs is kept for legacy
+    # fallback (harmless if unused).
     echo 'virtiofs' >> /etc/modules
+    echo '9p' >> /etc/modules
+    echo '9pnet' >> /etc/modules
+    echo '9pnet_fd' >> /etc/modules
 
     # Network: loopback only, as-guestd handles the rest
     mkdir -p /etc/network
@@ -146,29 +127,14 @@ sudo umount "$ROOTFS_DIR/proc" 2>/dev/null || true
 sudo umount "$ROOTFS_DIR/sys" 2>/dev/null || true
 sudo umount "$ROOTFS_DIR/dev" 2>/dev/null || true
 
-# Install as-guestd
-sudo cp "$BUILD_DIR/as-guestd" "$ROOTFS_DIR/usr/local/bin/as-guestd"
-sudo chmod +x "$ROOTFS_DIR/usr/local/bin/as-guestd"
-
-# OpenRC init script
-sudo tee "$ROOTFS_DIR/etc/init.d/as-guestd" > /dev/null <<'INITEOF'
-#!/sbin/openrc-run
-
-name="as-guestd"
-description="Agent Sandbox Guest Daemon"
-command="/usr/local/bin/as-guestd"
-command_background="yes"
-pidfile="/run/as-guestd.pid"
-output_log="/var/log/as-guestd.log"
-error_log="/var/log/as-guestd.log"
-
-depend() {
-    need localmount
-    after bootmisc
-}
-INITEOF
-sudo chmod +x "$ROOTFS_DIR/etc/init.d/as-guestd"
+# OpenRC init script (bootstrap — mounts as-guestpack.vhdx then execs
+# /opt/as-guestpack/as-guestd)
+sudo install -m 0755 "$SCRIPT_DIR/openrc/as-guestd.initd" \
+    "$ROOTFS_DIR/etc/init.d/as-guestd"
 sudo chroot "$ROOTFS_DIR" rc-update add as-guestd default
+
+# /opt/as-guestpack is where the bootstrap mounts the guestpack disk
+sudo mkdir -p "$ROOTFS_DIR/opt/as-guestpack"
 
 # fstab
 sudo tee "$ROOTFS_DIR/etc/fstab" > /dev/null <<'FSTAB'

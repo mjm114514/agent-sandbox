@@ -127,7 +127,8 @@ class Sandbox:
         return sb
 
     async def start(self) -> None:
-        await self._rpc.call("sandbox.start")
+        # Boot + as-guestd connect can take up to ~60s on a cold VM.
+        await self._rpc.call("sandbox.start", timeout=120)
         self._status = "running"
 
     async def stop(self) -> None:
@@ -180,6 +181,7 @@ class Sandbox:
         cwd: str = "/",
         cpu_limit: str | None = None,
         mem_limit: str | None = None,
+        file_guard: bool = False,
     ) -> Environment:
         params: dict = {"name": name, "cwd": cwd}
         if mounts:
@@ -193,9 +195,11 @@ class Sandbox:
             params["cpu_limit"] = cpu_limit
         if mem_limit:
             params["mem_limit"] = mem_limit
+        if file_guard:
+            params["file_guard"] = True
 
         await self._rpc.call("env.create", params)
-        return Environment(name, self._rpc)
+        return Environment(name, self._rpc, file_guard=file_guard)
 
     @property
     def network(self) -> Network:

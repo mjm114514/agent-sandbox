@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, AsyncIterable
 
+from sandbox.file_guard import FileGuard
 from sandbox.process import Process
 
 if TYPE_CHECKING:
@@ -9,9 +10,20 @@ if TYPE_CHECKING:
 
 
 class Environment:
-    def __init__(self, name: str, rpc: RpcConn):
+    def __init__(self, name: str, rpc: RpcConn, file_guard: bool = False):
         self.name = name
         self._rpc = rpc
+        self._file_guard_enabled = file_guard
+        self._file_guard: FileGuard | None = FileGuard(name, rpc) if file_guard else None
+
+    @property
+    def file_guard(self) -> FileGuard:
+        if self._file_guard is None:
+            raise RuntimeError(
+                f"file_guard not enabled for environment {self.name!r}; "
+                "pass file_guard=True to sb.environment()"
+            )
+        return self._file_guard
 
     async def exec(
         self,

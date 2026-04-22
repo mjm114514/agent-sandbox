@@ -21,6 +21,8 @@ sdk/sandbox/_bin/
 
 # VM image build
 /images/_build/
+/images/_guestpack_build/
+/images/_guestpack_stage/
 /images/output/
 /images/base/as-guestd
 

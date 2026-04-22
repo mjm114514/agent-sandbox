@@ -12,6 +12,7 @@ import (
 
 	"github.com/anthropics/agent-sandbox/as-guestd/env"
 	vmexec "github.com/anthropics/agent-sandbox/as-guestd/exec"
+	"github.com/anthropics/agent-sandbox/as-guestd/fileshare"
 	vmlog "github.com/anthropics/agent-sandbox/as-guestd/log"
 	vmmount "github.com/anthropics/agent-sandbox/as-guestd/mount"
 	"github.com/anthropics/agent-sandbox/as-guestd/rpc"
@@ -73,6 +74,7 @@ func serve(conn net.Conn) {
 	envMgr := env.NewManager()
 	runner := vmexec.NewRunner(rc)
 	mounter := vmmount.NewMounter()
+	shareMounter := fileshare.New(hostCID)
 
 	// Wire up log forwarding over RPC
 	logger.SetNotifier(rc.Notify)
@@ -197,6 +199,29 @@ func serve(conn net.Conn) {
 				break
 			}
 			rpcErr = mounter.Bind(p)
+			result = map[string]any{"ok": true}
+
+		case "file_share.mount":
+			var p fileshare.MountParams
+			if err := json.Unmarshal(msg.Params, &p); err != nil {
+				rpcErr = fmt.Errorf("parse params: %w", err)
+				break
+			}
+			rpcErr = shareMounter.Mount(p)
+			if rpcErr == nil {
+				logger.Info("file_share mounted %s at %s", p.EnvName, p.GuestPath)
+			}
+			result = map[string]any{"ok": true}
+
+		case "file_share.unmount":
+			var p struct {
+				GuestPath string `json:"guest_path"`
+			}
+			if err := json.Unmarshal(msg.Params, &p); err != nil {
+				rpcErr = fmt.Errorf("parse params: %w", err)
+				break
+			}
+			rpcErr = shareMounter.Unmount(p.GuestPath)
 			result = map[string]any{"ok": true}
 
 		case "mount.unbind":

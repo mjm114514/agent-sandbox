@@ -64,18 +64,32 @@ go build -o as-hostd.exe ./cmd/as-hostd/   # Windows
 
 ### 2. Build the VM image
 
-Requires WSL2 with `qemu-utils` installed:
+The VM boots off two disks:
+
+- **`rootfs.vhdx`** — stable base image (Alpine + deps + a bootstrap init
+  script). Rebuilt only when OS deps change.
+- **`as-guestpack.vhdx`** — small read-only ext4 carrying the current
+  `as-guestd` binary (and any other guest-side tooling). Rebuilt on
+  every guestd iteration (≈5s).
+
+Requires WSL2 with `qemu-utils` and `e2fsprogs` installed.
+
+**One-time base image build** (slow, needs sudo):
 
 ```bash
-# Build as-guestd
-cd as-guestd
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o as-guestd ./cmd/as-guestd/
-
-# Build the image (runs in WSL, needs sudo)
 wsl -e sudo bash images/build-wsl.sh
 ```
 
-This produces `as-hostd/boot/{vmlinuz, initramfs, rootfs.vhdx}`.
+Produces `as-hostd/boot/{vmlinuz, initramfs, rootfs.vhdx}`.
+
+**Iterative guestpack build** (fast, no sudo):
+
+```bash
+wsl -e bash images/build-guestpack-wsl.sh
+```
+
+Produces `as-hostd/boot/as-guestpack.vhdx`. Run this after any change
+to `as-guestd/**/*.go`; no need to touch the base rootfs.
 
 ### 3. Install the SDK
 

@@ -51,10 +51,12 @@ func (b *Backend) Create(cfg vmapi.Config) (vmapi.VM, error) {
 	kernelPath := filepath.Join(b.BootDir, "vmlinuz")
 	initrdPath := filepath.Join(b.BootDir, "initramfs")
 	rootfsPath := filepath.Join(b.BootDir, "rootfs.vhdx")
+	guestpackPath := filepath.Join(b.BootDir, "as-guestpack.vhdx")
 
 	absKernel, _ := filepath.Abs(kernelPath)
 	absInitrd, _ := filepath.Abs(initrdPath)
 	absRootfs, _ := filepath.Abs(rootfsPath)
+	absGuestpack, _ := filepath.Abs(guestpackPath)
 
 	// Create a differencing disk so the base image stays read-only
 	diffVhdx := filepath.Join(os.TempDir(), fmt.Sprintf("sandbox-%s-rootfs.vhdx", id))
@@ -64,6 +66,16 @@ func (b *Backend) Create(cfg vmapi.Config) (vmapi.VM, error) {
 	)
 	if out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", createDiffScript).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("create differencing disk: %s: %w", string(out), err)
+	}
+
+	// as-guestpack: optional — attached read-only if present so the
+	// guest's bootstrap service can mount it at /opt/as-guestpack and
+	// exec as-guestd from it. Rebuilt independently of the base rootfs.
+	hasGuestpack := false
+	if _, err := os.Stat(absGuestpack); err == nil {
+		hasGuestpack = true
+	} else {
+		log.Printf("as-guestpack not found at %s — falling back to any as-guestd baked into rootfs", absGuestpack)
 	}
 
 	// Build vsock port list
@@ -100,12 +112,7 @@ func (b *Backend) Create(cfg vmapi.Config) (vmapi.VM, error) {
 			"Devices": map[string]any{
 				"Scsi": map[string]any{
 					"0": map[string]any{
-						"Attachments": map[string]any{
-							"0": map[string]any{
-								"Type": "VirtualDisk",
-								"Path":  diffVhdx,
-							},
-						},
+						"Attachments": scsiAttachments(diffVhdx, absGuestpack, hasGuestpack),
 					},
 				},
 				"HvSocket": map[string]any{
@@ -214,24 +221,29 @@ func (v *hcsVM) Start() error {
 }
 
 func (v *hcsVM) getRuntimeID() guid.GUID {
-	query, _ := syscall.UTF16PtrFromString(`{"PropertyTypes":["RuntimeId"]}`)
+	// computecore.dll's HcsGetComputeSystemProperties is async:
+	//   (HcsSystem, HcsOperation, propertyQuery, options) — result comes
+	// out of HcsWaitForOperationResult. RuntimeId ships in the default
+	// property bag; we pass an empty query because "RuntimeId" is not a
+	// valid PropertyTypes enum value on this Windows build.
+	query, _ := syscall.UTF16PtrFromString(`{}`)
 
 	op := createOperation()
 	defer closeOperation(op)
 
-	var resultDoc *uint16
 	r1, _, _ := procHcsGetComputeSystemProperties.Call(
 		uintptr(v.handle),
 		op,
 		uintptr(unsafe.Pointer(query)),
-		uintptr(unsafe.Pointer(&resultDoc)),
+		0, // options: none
 	)
 	if r1 != 0 {
-		log.Printf("HcsGetComputeSystemProperties: HRESULT 0x%08x: %s", r1, readUTF16Ptr(resultDoc))
+		log.Printf("HcsGetComputeSystemProperties start: HRESULT 0x%08x", r1)
 		return guid.GUID{}
 	}
 
-	if err := waitForOperation(op, 10000); err != nil {
+	result, err := waitForOperationResult(op, 10000)
+	if err != nil {
 		log.Printf("HcsGetComputeSystemProperties wait: %v", err)
 		return guid.GUID{}
 	}
@@ -239,8 +251,8 @@ func (v *hcsVM) getRuntimeID() guid.GUID {
 	var props struct {
 		RuntimeId string `json:"RuntimeId"`
 	}
-	if err := json.Unmarshal([]byte(readUTF16Ptr(resultDoc)), &props); err != nil {
-		log.Printf("parse compute system properties: %v", err)
+	if err := json.Unmarshal([]byte(result), &props); err != nil {
+		log.Printf("parse compute system properties: %v (doc=%q)", err, result)
 		return guid.GUID{}
 	}
 
@@ -356,6 +368,27 @@ func (v *hcsVM) State() vmapi.State {
 	return v.state
 }
 
+// scsiAttachments builds the SCSI attachment map for the HCS document.
+// LUN 0 is the per-VM differencing rootfs (rw); LUN 1 is the shared
+// as-guestpack VHDX (ro) when present. Guestpack is optional: older
+// setups without it fall back to any as-guestd baked into the rootfs.
+func scsiAttachments(rootfsDiff, guestpackPath string, hasGuestpack bool) map[string]any {
+	a := map[string]any{
+		"0": map[string]any{
+			"Type": "VirtualDisk",
+			"Path": rootfsDiff,
+		},
+	}
+	if hasGuestpack {
+		a["1"] = map[string]any{
+			"Type":     "VirtualDisk",
+			"Path":     guestpackPath,
+			"ReadOnly": true,
+		}
+	}
+	return a
+}
+
 func vsockPortToServiceGUID(port uint32) guid.GUID {
 	return guid.GUID{
 		Data1: port,
@@ -384,6 +417,23 @@ func createOperation() uintptr {
 
 func closeOperation(op uintptr) {
 	procHcsCloseOperation.Call(op)
+}
+
+// waitForOperationResult is waitForOperation that also returns the result
+// document string produced by the completed operation (used by
+// HcsGetComputeSystemProperties to carry the properties JSON back).
+func waitForOperationResult(op uintptr, timeoutMs uint32) (string, error) {
+	var resultDoc *uint16
+	r1, _, _ := procHcsWaitForOperationResult.Call(
+		op,
+		uintptr(timeoutMs),
+		uintptr(unsafe.Pointer(&resultDoc)),
+	)
+	s := readUTF16Ptr(resultDoc)
+	if r1 != 0 {
+		return s, fmt.Errorf("HRESULT 0x%08x: %s", r1, s)
+	}
+	return s, nil
 }
 
 func waitForOperation(op uintptr, timeoutMs uint32) error {

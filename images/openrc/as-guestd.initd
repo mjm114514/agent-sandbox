@@ -1,14 +1,62 @@
 #!/sbin/openrc-run
+#
+# Bootstrap: mount the as-guestpack disk (attached as /dev/sdb), then
+# exec /opt/as-guestpack/as-guestd. The base VM image ships with no
+# as-guestd of its own — the binary is rebuilt into as-guestpack.vhdx
+# on every iteration.
+#
+# If /dev/sdb doesn't appear within a few seconds we fall back to
+# /usr/local/bin/as-guestd (for older images that embed it directly).
 
 name="as-guestd"
-description="Agent Sandbox Guest Daemon"
-command="/usr/local/bin/as-guestd"
+description="Agent Sandbox Guest Daemon (loaded from as-guestpack)"
 command_background="yes"
 pidfile="/run/as-guestd.pid"
 output_log="/var/log/as-guestd.log"
 error_log="/var/log/as-guestd.log"
 
+GUESTPACK_DEV="${GUESTPACK_DEV:-/dev/sdb}"
+GUESTPACK_MNT="${GUESTPACK_MNT:-/opt/as-guestpack}"
+GUESTPACK_WAIT="${GUESTPACK_WAIT:-20}"
+
 depend() {
     need localmount
     after bootmisc
+}
+
+start_pre() {
+    # Wait for the guestpack block device to appear.
+    local waited=0
+    while [ ! -b "$GUESTPACK_DEV" ] && [ $waited -lt $GUESTPACK_WAIT ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if [ -b "$GUESTPACK_DEV" ]; then
+        mkdir -p "$GUESTPACK_MNT"
+        if ! mountpoint -q "$GUESTPACK_MNT"; then
+            mount -t ext4 -o ro "$GUESTPACK_DEV" "$GUESTPACK_MNT" || {
+                eerror "failed to mount $GUESTPACK_DEV at $GUESTPACK_MNT"
+                return 1
+            }
+        fi
+        if [ -x "$GUESTPACK_MNT/as-guestd" ]; then
+            command="$GUESTPACK_MNT/as-guestd"
+            einfo "using as-guestd from guestpack ($GUESTPACK_MNT/as-guestd)"
+            return 0
+        fi
+        ewarn "guestpack mounted but $GUESTPACK_MNT/as-guestd missing"
+    else
+        ewarn "no guestpack at $GUESTPACK_DEV after ${GUESTPACK_WAIT}s"
+    fi
+
+    # Fallback: old images embed as-guestd directly.
+    if [ -x /usr/local/bin/as-guestd ]; then
+        command=/usr/local/bin/as-guestd
+        einfo "using embedded as-guestd (legacy path)"
+        return 0
+    fi
+
+    eerror "no as-guestd binary found on guestpack or in base image"
+    return 1
 }

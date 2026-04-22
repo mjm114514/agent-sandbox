@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -12,10 +14,21 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anthropics/agent-sandbox/as-hostd/fileguard"
+	"github.com/anthropics/agent-sandbox/as-hostd/fileshare"
 	"github.com/anthropics/agent-sandbox/as-hostd/netstack"
 	"github.com/anthropics/agent-sandbox/as-hostd/rpc"
 	"github.com/anthropics/agent-sandbox/as-hostd/vm"
 	"github.com/anthropics/agent-sandbox/as-hostd/vm/hcs"
+)
+
+const (
+	fileShareVSockPort = 1002
+	// vmLevelEnv is a reserved env-name used as the aname key for mounts
+	// registered at sandbox creation time (visible to all environments).
+	// Real env names can't contain "@" because they become Linux
+	// usernames (sandbox-<name>), so this won't collide.
+	vmLevelEnv = "@vm"
 )
 
 type vmMount struct {
@@ -37,6 +50,13 @@ type daemon struct {
 	vmMounts       []vmMount
 	status         string // "running", "degraded", "dead"
 	lastHeartbeat  time.Time
+
+	// File Guard / file share plumbing.
+	fshare   *fileshare.Server
+	fsCtx    context.Context
+	fsCancel context.CancelFunc
+	stateDir string
+	guards   map[string]*fileguard.Store // env name -> store
 }
 
 func main() {
@@ -47,7 +67,11 @@ func main() {
 	d := &daemon{
 		vsockStreams:   make(map[int]net.Conn),
 		portForwarders: make(map[int]net.Listener),
+		guards:         make(map[string]*fileguard.Store),
+		stateDir:       resolveStateDir(),
 	}
+	d.fshare = fileshare.New()
+	d.fsCtx, d.fsCancel = context.WithCancel(context.Background())
 	d.detectBackend()
 
 	sdkServer := rpc.NewStdioServer(os.Stdin, os.Stdout, nil)
@@ -57,6 +81,17 @@ func main() {
 	if err := sdkServer.Serve(); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
+}
+
+func resolveStateDir() string {
+	if v := os.Getenv("AS_HOSTD_STATE_DIR"); v != "" {
+		return v
+	}
+	cache, err := os.UserCacheDir()
+	if err != nil || cache == "" {
+		cache = os.TempDir()
+	}
+	return filepath.Join(cache, "agent-sandbox")
 }
 
 func (d *daemon) detectBackend() {
@@ -97,6 +132,16 @@ func (d *daemon) handleSDKCall(method string, params json.RawMessage) (any, erro
 		return d.networkExpose(params)
 	case "env.export":
 		return d.envExport(params)
+	case "env.close":
+		return d.envClose(params)
+	case "file_guard.list":
+		return d.fileGuardList(params)
+	case "file_guard.restore":
+		return d.fileGuardRestore(params)
+	case "file_guard.status":
+		return d.fileGuardStatus(params)
+	case "file_guard.clear":
+		return d.fileGuardClear(params)
 	case "sandbox.status":
 		d.mu.Lock()
 		status := d.status
@@ -238,19 +283,40 @@ func (d *daemon) sandboxStart() (any, error) {
 		return nil, fmt.Errorf("timeout waiting for as-guestd to connect — VM may have failed to boot. Check if hv_sock module is available in the guest kernel")
 	}
 
-	// Share and bind VM-level mounts
+	// Start the 9P file-share listener on vsock 1002. Each incoming
+	// guest connection sends a length-prefixed aname ("env|/guest/path")
+	// before the kernel 9P client takes over the fd.
+	fsListener, err := d.currentVM.VSockListen(fileShareVSockPort)
+	if err != nil {
+		log.Printf("vsock listen file_share (port %d): %v — file guard mounts unavailable", fileShareVSockPort, err)
+	} else {
+		go func() {
+			if err := d.fshare.ListenAndServe(d.fsCtx, fsListener); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("file_share listener exited: %v", err)
+			}
+		}()
+		log.Printf("file_share listening on vsock :%d", fileShareVSockPort)
+	}
+
+	// VM-level mounts go through the 9P file-share server with a synthetic
+	// env name. They're visible to all environments because they land in
+	// the VM's root mount namespace.
 	for _, m := range d.vmMounts {
-		if err := d.currentVM.ShareDir(m.Tag, m.HostPath); err != nil {
-			return nil, fmt.Errorf("share dir %s: %w", m.HostPath, err)
-		}
-		_, err := d.agentConn.Call("mount.bind", map[string]string{
-			"virtiofs_tag": m.Tag,
-			"guest_path":   m.GuestPath,
+		d.fshare.Register(&fileshare.Mount{
+			EnvName:   vmLevelEnv,
+			GuestRoot: m.GuestPath,
+			HostRoot:  m.HostPath,
+			Store:     nil, // no file_guard at VM level in v1
+		})
+		_, err := d.agentConn.Call("file_share.mount", map[string]any{
+			"env_name":   vmLevelEnv,
+			"guest_path": m.GuestPath,
+			"vsock_port": fileShareVSockPort,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("mount.bind %s: %w", m.GuestPath, err)
+			return nil, fmt.Errorf("file_share.mount %s: %w", m.GuestPath, err)
 		}
-		log.Printf("mounted %s -> %s (tag=%s)", m.HostPath, m.GuestPath, m.Tag)
+		log.Printf("mounted %s -> %s via 9P (vm-level)", m.HostPath, m.GuestPath)
 	}
 
 	return map[string]any{"ok": true}, nil
@@ -313,6 +379,15 @@ func (d *daemon) sandboxDestroy() (any, error) {
 	if d.currentVM == nil {
 		return nil, fmt.Errorf("no VM to destroy")
 	}
+	if d.fsCancel != nil {
+		d.fsCancel()
+	}
+	d.mu.Lock()
+	for name, g := range d.guards {
+		g.Close()
+		delete(d.guards, name)
+	}
+	d.mu.Unlock()
 	if err := d.currentVM.Destroy(); err != nil {
 		return nil, err
 	}
@@ -331,7 +406,8 @@ type envCreateParams struct {
 		GuestPath string `json:"guest_path"`
 		Mode      string `json:"mode"`
 	} `json:"mounts,omitempty"`
-	Env map[string]string `json:"env,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+	FileGuard bool              `json:"file_guard,omitempty"`
 }
 
 func (d *daemon) envCreate(params json.RawMessage) (any, error) {
@@ -344,25 +420,44 @@ func (d *daemon) envCreate(params json.RawMessage) (any, error) {
 		return nil, fmt.Errorf("as-guestd not connected")
 	}
 
-	// Provision mounts: share host dirs into VM, then tell as-guestd to bind them
-	var agentMounts []map[string]string
-	for i, m := range p.Mounts {
-		tag := fmt.Sprintf("env-%s-mount-%d", p.Name, i)
-		if err := d.currentVM.ShareDir(tag, m.HostPath); err != nil {
-			return nil, fmt.Errorf("share dir %s: %w", m.HostPath, err)
+	// If file_guard is on, open a per-env Store. All guarded mounts in
+	// this env share it so they land under one <state_dir>/guard/<env>/.
+	var guard *fileguard.Store
+	if p.FileGuard {
+		baseDir := filepath.Join(d.stateDir, "guard", p.Name)
+		g, err := fileguard.Open(p.Name, baseDir, 0)
+		if err != nil {
+			return nil, fmt.Errorf("open file guard store: %w", err)
 		}
-		// Tell as-guestd to mount the virtiofs share
-		_, err := d.agentConn.Call("mount.bind", map[string]string{
-			"virtiofs_tag": tag,
-			"guest_path":   m.GuestPath,
+		d.mu.Lock()
+		d.guards[p.Name] = g
+		d.mu.Unlock()
+		guard = g
+	}
+
+	// All env-level mounts go through the host 9P server on vsock 1002.
+	// file_guard=True just means the mount registration carries a Store
+	// that hooks mutations; without file_guard the path is pure
+	// pass-through (no per-op overhead beyond the 9P protocol itself).
+	var agentMounts []map[string]string
+	for _, m := range p.Mounts {
+		d.fshare.Register(&fileshare.Mount{
+			EnvName:   p.Name,
+			GuestRoot: m.GuestPath,
+			HostRoot:  m.HostPath,
+			Store:     guard, // nil when file_guard=false
+		})
+		_, err := d.agentConn.Call("file_share.mount", map[string]any{
+			"env_name":   p.Name,
+			"guest_path": m.GuestPath,
+			"vsock_port": fileShareVSockPort,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("mount.bind %s: %w", m.GuestPath, err)
+			return nil, fmt.Errorf("file_share.mount %s: %w", m.GuestPath, err)
 		}
 		agentMounts = append(agentMounts, map[string]string{
-			"virtiofs_tag": tag,
-			"guest_path":   m.GuestPath,
-			"mode":         m.Mode,
+			"guest_path": m.GuestPath,
+			"mode":       m.Mode,
 		})
 	}
 
@@ -389,6 +484,111 @@ func (d *daemon) envCreate(params json.RawMessage) (any, error) {
 		return nil, err
 	}
 	return json.RawMessage(*result), nil
+}
+
+func (d *daemon) envClose(params json.RawMessage) (any, error) {
+	var p struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, err
+	}
+	if d.agentConn == nil {
+		return nil, fmt.Errorf("as-guestd not connected")
+	}
+	// Forward to guest first so processes are torn down.
+	result, err := d.agentConn.Call("env.close", map[string]any{"name": p.Name})
+	// Always clean up host-side state, even on guest error.
+	d.fshare.UnregisterEnv(p.Name)
+	d.mu.Lock()
+	g := d.guards[p.Name]
+	delete(d.guards, p.Name)
+	d.mu.Unlock()
+	if g != nil {
+		g.Close()
+	}
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(*result), nil
+}
+
+func (d *daemon) guardFor(envName string) (*fileguard.Store, error) {
+	d.mu.Lock()
+	g, ok := d.guards[envName]
+	d.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("file_guard not enabled for env %q", envName)
+	}
+	return g, nil
+}
+
+func (d *daemon) fileGuardList(params json.RawMessage) (any, error) {
+	var p struct {
+		EnvName string `json:"env_name"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, err
+	}
+	g, err := d.guardFor(p.EnvName)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"entries": g.List()}, nil
+}
+
+func (d *daemon) fileGuardRestore(params json.RawMessage) (any, error) {
+	var p struct {
+		EnvName string `json:"env_name"`
+		Path    string `json:"path"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, err
+	}
+	g, err := d.guardFor(p.EnvName)
+	if err != nil {
+		return nil, err
+	}
+	if err := g.Restore(p.Path); err != nil {
+		if errors.Is(err, fileguard.ErrNoBackup) {
+			return nil, &rpc.Error{Code: -32001, Message: err.Error()}
+		}
+		return nil, err
+	}
+	return map[string]any{"ok": true}, nil
+}
+
+func (d *daemon) fileGuardStatus(params json.RawMessage) (any, error) {
+	var p struct {
+		EnvName string `json:"env_name"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, err
+	}
+	d.mu.Lock()
+	g, ok := d.guards[p.EnvName]
+	d.mu.Unlock()
+	if !ok {
+		return map[string]any{"enabled": false}, nil
+	}
+	return g.Status(), nil
+}
+
+func (d *daemon) fileGuardClear(params json.RawMessage) (any, error) {
+	var p struct {
+		EnvName string `json:"env_name"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, err
+	}
+	g, err := d.guardFor(p.EnvName)
+	if err != nil {
+		return nil, err
+	}
+	if err := g.Clear(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"ok": true}, nil
 }
 
 func (d *daemon) vsockConnect(params json.RawMessage) (any, error) {

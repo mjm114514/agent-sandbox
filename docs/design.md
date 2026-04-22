@@ -258,17 +258,26 @@ asyncio.run(main())
 
 ## VM Image
 
-The base image is a minimal Linux (e.g., Alpine or Ubuntu minimal) shipping with:
+The VM boots off **two disks** so we can iterate on `as-guestd` without
+rebuilding the base image every time:
 
-- **as-guestd** binary at `/usr/local/bin/as-guestd`, started by an OpenRC service.
-- **bubblewrap** (`bwrap`) installed.
-- **virtiofs** kernel support enabled.
-- A passwordless `sandbox-admin` user for as-guestd to run as, with sudo rights for `useradd`, `userdel`, `bwrap`, and `cgcreate`.
-- No SSH, no unnecessary services.
+- **`rootfs.vhdx`** (SCSI 0 LUN 0) — Alpine + bubblewrap + virtiofs +
+  `sandbox-admin` user with a passwordless sudoers entry for
+  `useradd`/`userdel`/`bwrap`/`cgcreate`. Also carries a bootstrap
+  OpenRC service (`/etc/init.d/as-guestd`) that waits for the
+  guestpack disk, mounts it at `/opt/as-guestpack`, and execs
+  `/opt/as-guestpack/as-guestd`. Rebuilt only when OS-level deps change.
+- **`as-guestpack.vhdx`** (SCSI 0 LUN 1, read-only) — small ext4
+  holding the current `as-guestd` binary (and any other guest-side
+  tooling we want to ship out-of-band). Rebuilt on every iteration via
+  `images/build-guestpack-wsl.sh` in ≈5 seconds, no sudo required
+  (`mke2fs -d` stages the directory directly).
 
-The image is intentionally minimal. Users extend the VM's capabilities at runtime by mounting host directories containing their binaries and configuration, then launching services via `Sandbox.exec()`. This avoids the need for custom image builds in most cases.
+This split keeps the slow image build (package installs, initramfs) off
+the hot iteration loop. The base image is intentionally minimal —
+users extend the VM's capabilities at runtime via mounts + `sb.exec()`.
 
-Image build tooling (Packer or a shell script) lives in `images/` in this repo.
+Image build tooling (shell script + Dockerfile) lives in `images/`.
 
 ## vsock Protocol
 
