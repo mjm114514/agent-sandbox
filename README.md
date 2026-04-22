@@ -11,7 +11,8 @@ For architecture and design rationale, see [docs/design.md](docs/design.md).
 - **One-VM-per-app model.** A single long-lived VM hosts many cheap, disposable agent workspaces.
 - **Transparent networking.** Guest traffic exits through the host's network stack — DNS, proxy, TLS trust all inherited automatically.
 - **Fast environments.** Per-agent isolation via `useradd` + bubblewrap + cgroups; no VM reboot between tasks.
-- **Mount host directories** into the VM or into a specific environment, read-only or read-write.
+- **Mount host directories** into the VM or into a specific environment, read-only or read-write. All mounts ride a self-hosted 9P server on vsock — no hypervisor-specific file-share device required.
+- **File Guard** (opt-in per env): the 9P server backs up any mounted file on first modification and exposes `list` / `restore` / `status` / `clear` through the SDK. See [docs/file-guard.md](docs/file-guard.md).
 - **Streaming process I/O** for stdout, stderr, stdin, signals, and exit codes.
 - **Vsock ports** for direct host↔guest communication to build custom services (proxies, credential brokers, etc.).
 - **Python SDK** with `asyncio` API; Go host daemon (`as-hostd`) + in-guest daemon (`as-guestd`).
@@ -124,6 +125,30 @@ async with await sb.environment(
     proc = await env.exec(["make", "test"])
     await proc.wait()
 ```
+
+### File Guard
+
+Pass `file_guard=True` to snapshot-on-first-modification any file the
+agent touches under a mount. Review and selectively roll back after the
+task:
+
+```python
+async with await sb.environment(
+    name="refactor-task",
+    mounts=[Mount("/home/me/project", "/work")],
+    cwd="/work",
+    file_guard=True,
+) as env:
+    await (await env.exec(["my-agent", "refactor", "--aggressive"])).wait()
+
+    for entry in await env.file_guard.list():
+        print(entry.current_state, entry.path)
+
+    await env.file_guard.restore("/work/src/important.py")
+```
+
+See [docs/file-guard.md](docs/file-guard.md) for the backup layout,
+caps, and recovery semantics.
 
 ### Process
 

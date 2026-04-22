@@ -8,13 +8,15 @@ file, corrupt a working tree. The sandbox's job is to make those
 mistakes **visible** (show what changed) and **reversible** (get the
 original back).
 
-Today, file sharing goes through the hypervisor's native 9P stack
-(HCS Plan 9 on Windows, AVF virtiofs on macOS). Those are black boxes
-— the host has no protocol-level visibility into what the guest does
-with shared directories. File Guard replaces that path with a
-self-hosted 9P server running in-process with `as-hostd`: pass-through
-by default, with a per-env opt-in that backs up any file on first
-modification and exposes a change list to the SDK.
+The hypervisor's native file-share paths (HCS Plan 9, AVF virtiofs) are
+black boxes — the host has no protocol-level visibility into what the
+guest does with shared directories. We replaced them with a
+self-hosted 9P2000.L server running in-process with `as-hostd` on
+vsock port 1002. Every SDK mount — sandbox-level and environment-level
+— now rides this server. Without `file_guard=True` the server is pure
+pass-through; with it enabled, every mutating op flows through a hook
+that backs up the pre-mutation content and exposes a change list to
+the SDK.
 
 ## Threat Model
 
@@ -30,24 +32,27 @@ want the agent touching a tree, they don't mount it.
 ## Architecture
 
 ```
-┌─ host (as-hostd) ──────────────────────────────────┐
-│   SDK ─► env.create(mounts, file_guard=True)       │
-│                           │                        │
-│                           ▼                        │
-│                   9P server (hugelgupf/p9)         │
-│                     ├─ pass-through dispatch       │
-│                     └─ FileGuard (per env, opt-in) │
-│                             ├─ touched map         │
-│                             └─ backup store        │
-│                                   │                │
-│                                   ▼                │
-│                            vsock listener :1002    │
-└────────────────────────────────────────────────────┘
+┌─ host (as-hostd) ──────────────────────────────────────────┐
+│   SDK ─► sandbox.create(mounts=…)            ─► @vm mounts │
+│   SDK ─► env.create(mounts, file_guard=True) ─► per-env    │
+│                           │                                │
+│                           ▼                                │
+│                   9P server (hugelgupf/p9)                 │
+│                     ├─ per-conn attacher (aname-routed)    │
+│                     ├─ pass-through dispatch               │
+│                     └─ FileGuard (Store attached per-env)  │
+│                             ├─ touched map                 │
+│                             └─ backup store                │
+│                                   │                        │
+│                                   ▼                        │
+│                            vsock listener :1002            │
+└────────────────────────────────────────────────────────────┘
                                     │
-┌─ guest (as-guestd) ────────────────┼───────────────┐
-│   file_share.mount ─► vsock.Dial(host, 1002)       │
-│                       mount -t 9p -o trans=fd,...  │
-└────────────────────────────────────────────────────┘
+┌─ guest (as-guestd) ────────────────┼───────────────────────┐
+│   file_share.mount ─► AF_VSOCK connect(host, 1002)         │
+│                       write [2-byte len][aname] frame      │
+│                       syscall.Mount(…, "9p", trans=fd,…)   │
+└────────────────────────────────────────────────────────────┘
 ```
 
 ## Transport: vsock + trans=fd
@@ -56,17 +61,46 @@ The host 9P server listens on **vsock port 1002**.
 
 In the guest, `as-guestd`:
 1. Receives `file_share.mount {env_name, guest_path}` from `as-hostd`.
-2. Dials `vsock.Dial(hostCID, 1002)` — full-duplex FD.
-3. Issues `mount -t 9p -o trans=fd,rfdno=N,wfdno=N,uname=<env>,aname=<env>,version=9p2000.L,msize=1048576,cache=loose <target>`.
+2. Opens a raw `AF_VSOCK` socket via direct syscall (bypassing Go's
+   netpoller — keeps the fd simple and blocking).
+3. Writes a length-prefixed aname frame to the socket (see **Aname
+   routing** below).
+4. Calls `mount(2)` directly via `syscall.Mount` with options
+   `trans=fd,rfdno=N,wfdno=N,uname=root,aname=/,version=9p2000.L,msize=65536`
+   where N is the socket fd.
 
-The kernel 9p client dups the FD during `mount(2)`. `as-guestd`'s
-`mount` subprocess closes its copy after the syscall returns; the
-kernel's dup keeps the session alive regardless of `as-guestd`
-lifecycle. Session dies only when the **host** end of the vsock closes
-(`as-hostd` crash or explicit unmount).
+Calling `mount(2)` directly instead of exec'ing mount(8) keeps the fd
+in our own fd table, avoids `ExtraFiles` plumbing, and surfaces the
+real errno on failure. The kernel 9p client does `fget(N)` on entry to
+take its own reference, so closing our copy after `mount(2)` returns
+doesn't tear down the session. The session dies when either end of
+the vsock closes (`as-hostd` crash or explicit unmount).
 
 `trans=fd` over vsock works identically on HCS (Hyper-V sockets) and
 AVF (virtio-vsock). No dependency on hypervisor-provided 9P devices.
+
+### Aname routing
+
+`hugelgupf/p9` v0.3.0's `Attacher.Attach()` has no aname parameter,
+and the Tattach message's `AttachName` is interpreted by the library
+as a sub-path to walk into the root — unusable as a routing key.
+Instead, the guest writes a length-prefixed frame at the start of
+every connection, **before** the kernel 9P client takes over:
+
+```
+[2-byte big-endian length][aname UTF-8 bytes]
+```
+
+The host reads this frame synchronously, creates a per-connection
+`p9.Server` whose `Attacher` has the aname baked in, then hands the
+rest of the connection to `p9.Server.Handle`. The mount-option
+`aname=/` asks the kernel to attach at the server's root.
+
+**Aname format** is `<env-name>|<guest-path>`. For sandbox-level
+mounts (those registered via `Sandbox.create(mounts=…)`) the
+env-name is the reserved literal `@vm`. `@` can't appear in an
+environment name because env names become Linux usernames prefixed
+with `sandbox-`, so there's no collision.
 
 ## 9P Server
 
@@ -75,25 +109,37 @@ translation over the host filesystem — `Twalk`/`Topen`/`Tread`/... map
 directly to `openat`/`read`/... No caching, no policy. Without
 FileGuard it's essentially `diod` in Go.
 
-**QID identity** comes from `(st_dev, st_ino)` on Linux/macOS and
-`FILE_ID_INFO` on Windows — required for kernel 9p-client cache
-coherence on rename/hardlink. Windows 8+ only.
+**QID identity** comes from `(st_dev, st_ino)` on Linux/macOS. On
+Windows v1 uses a synthetic monotonic uint64 keyed by normalized
+host path — a full FILE_ID_INFO lookup is planned but not required
+for agent workloads in the benign-but-fallible threat model (a stale
+QID after rename-over-unlink causes at worst a kernel 9p-client cache
+miss, no correctness issue).
 
-**Unsupported ops** return `EOPNOTSUPP`: `Tmknod` (agents don't need
-device nodes), `Tlock`/`Tgetlock` (silent success would corrupt sqlite
-and git), `Txattrwalk`/`Txattrcreate` (rarely used; reduces surface).
+**Unsupported ops** return `EOPNOTSUPP`/`ENOSYS`: `Tmknod` (agents
+don't need device nodes), `Tlock`/`Tgetlock` (silent success would
+corrupt sqlite and git), `Txattrwalk`/`Txattrcreate` (rarely used;
+reduces surface).
 
 ## File Guard
 
-Opt-in per env via `file_guard=True`. When enabled, the server
-intercepts the first mutating op on each path — copy current content
-to backup, then let the op proceed. Subsequent mutations on the same
-path pass through unchanged. No mount-time walk, no tracking of which
-files were there before.
+The 9P server is always the transport; File Guard is an opt-in hook
+layered on top. Enable it via `file_guard=True` on `sb.environment()`.
+When enabled, the mount registration carries a per-env `Store`, and
+every mutating op checks in with the Store before the operation
+proceeds: if this is the first mutation observed for the path, copy
+current content to the backup dir, write a meta sidecar, add the
+path to the `touched` map. Subsequent mutations on the same path are
+pass-through.
+
+No mount-time walk, no tracking of which files were there before, no
+file-guard support at the sandbox (`@vm`) level in v1 — only named
+environments can enable guard.
 
 Agent-created files are treated the same way: the first time the
-agent modifies one, we back up whatever's there. Slightly redundant
-but keeps the rule uniform.
+agent modifies one, the Store records an entry with
+`backup_available=false` (there was nothing to copy). Slightly
+redundant but keeps the rule uniform.
 
 ### SDK
 
@@ -107,8 +153,8 @@ async with await sb.environment(
     await proc.wait()
 
     # Review what happened
-    for c in await env.file_guard.list():
-        print(c["current_state"], c["path"])
+    for entry in await env.file_guard.list():
+        print(entry.current_state, entry.path)
 
     # Undo a specific change
     await env.file_guard.restore("/work/src/important.py")
@@ -143,13 +189,14 @@ async with await sb.environment(
 | `deleted` | File does not exist at `path`. Includes rename-away. |
 | `reverted` | File exists at `path` and byte-for-byte matches the backup. |
 
-`file_guard=False` (default) disables all hooks — zero overhead.
+`file_guard=False` (default) registers the mount with a nil Store —
+the 9P server pass-throughs every op without invoking any hook.
 
 ### Hook points
 
-State: `touched map[string]struct{}` keyed by canonical host path,
-protected by a per-path lock. One entry per distinct path mutated
-this session.
+State: `touched map[string]*entry` keyed by canonical host path,
+protected by a single `sync.Mutex`. One entry per distinct path
+mutated this session.
 
 Each op classifies which path(s) it mutates, then for each mutated
 path: if not in `touched`, copy current content to `by-path/<rel>.orig`,
@@ -159,9 +206,10 @@ write `<rel>.meta.json`, add to `touched`. Otherwise pass through.
 |---|---|
 | `Twrite` / `Topen(O_TRUNC)` / `Tsetattr` with size change | The fid's current path. |
 | `Tunlinkat` | The deleted path. |
-| `Trename` | The source path; also the destination, only if it existed before the rename. |
+| `Trename` / `TrenameAt` | The source path; also the destination, only if it existed before the rename. |
+| `Tcreate` | The created path (records it as `backup_available=false` — there was nothing to back up). |
 | `Tsetattr` mode/uid/gid only | — (v1 doesn't back up metadata-only changes). |
-| `Tcreate`, `Tread`, `Tgetattr`, `Treaddir` | — (pass-through). |
+| `Tread`, `Tgetattr`, `Treaddir` | — (pass-through). |
 
 After a rename, subsequent mutations at the destination trigger a
 fresh backup of the just-renamed-in content — often redundant with
@@ -178,9 +226,19 @@ the source's backup, but it keeps the model path-local and stateless.
     └── work/bar.txt.orig, .meta.json
 ```
 
+`<state_dir>` is `$AS_HOSTD_STATE_DIR` if set, otherwise
+`<UserCacheDir>/agent-sandbox` (`%LOCALAPPDATA%\agent-sandbox` on
+Windows, `~/.cache/agent-sandbox` on Linux,
+`~/Library/Caches/agent-sandbox` on macOS).
+
 `by-path/` is the authoritative list of touched files — no separate
-change log. Sidecar meta: `{first_mutation_ts, size_at_backup}`.
-Backups are plain file copies; no compression in v1.
+change log. On host paths, leading separator is stripped and any
+Windows drive colon is flattened (`D:/foo/bar` → `D/foo/bar.orig`)
+so the relative layout is valid on every OS. Sidecar meta:
+`{first_mutation_ts, size_at_backup, backup_available, rel_path,
+host_path, guest_path}`. Backups are plain file copies; no
+compression in v1. The store is rebuilt from disk sidecars on
+`Open`, so a crash mid-session leaves a recoverable state.
 
 ### Backup cap
 
@@ -213,9 +271,10 @@ elsewhere, it's left alone — the user deletes it if they want.
 
 - **`as-hostd` crash**: backups survive on disk; the env is marked
   dead via the existing heartbeat mechanism (see `error-recovery.md`).
-  The SDK can inspect the orphaned store via
-  `sb.file_guard.list_orphaned(env_name)` for post-mortem, then drop
-  `<state_dir>/guard/<env>/`. We do not resume envs across restarts.
+  Orphaned stores can be inspected directly at
+  `<state_dir>/guard/<env>/` — the `by-path/` layout is stable and
+  human-readable. We do not resume envs across restarts; the SDK
+  reports a fresh guard view on each `env.create`.
 - **Disk full on backup write**: same behavior as cap exceeded.
 
 ## Cross-platform
@@ -251,13 +310,25 @@ elsewhere, it's left alone — the user deletes it if they want.
   the same 9P server.
 - **Protecting agent-created state**: creation isn't a mutation, so
   create-then-delete leaves no record.
+- **Sandbox-level (`@vm`) file_guard**: only per-environment
+  `file_guard=True` is wired. The plumbing to attach a Store at the
+  `@vm` aname exists but isn't exposed through `Sandbox.create(…)`
+  yet.
 
-## Open questions
+## Known limitations
 
 1. **Agent-created file noise**: `list()` includes files the agent
    created and later modified. Usually small and harmless. If noisy
-   in practice, v2 could observe `Tcreate` and suppress the first
-   post-create backup.
+   in practice, a future version could observe `Tcreate` and suppress
+   the first post-create entry.
 2. **Large-file opt-out**: one giant `Twrite` on a 10 GiB file costs
-   10 GiB of backup. Worth a size threshold above which we record
-   the mutation without an `.orig`, like the cap-exceeded case?
+   10 GiB of backup. A size threshold above which we record the
+   mutation without an `.orig` (similar to the cap-exceeded case) is
+   future work.
+3. **Windows QID identity**: synthetic per-path uint64; a rename
+   followed by a fresh file at the old path can reuse the QID and
+   cause a kernel 9p-client cache miss. Not a correctness issue.
+4. **FS-level locks**: `Tlock`/`Tgetlock` return `ENOSYS`. Tools that
+   depend on advisory locking (sqlite under WAL, some git operations)
+   may show warnings. The alternative — silent success — would
+   corrupt data, so this stays opt-in at the tool level.

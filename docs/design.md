@@ -35,7 +35,7 @@ Inside the VM, multiple **environments** — each a bwrap-isolated, ephemeral us
 │     ├─ tap-bridge       TAP ↔ vsock tunnel                   │
 │     ├─ env-manager      useradd / bwrap / cgroup             │
 │     ├─ exec-runner      spawn & stream processes             │
-│     └─ mount-mounter    bind virtiofs shares into bwrap      │
+│     └─ fileshare        9P-over-vsock mount (trans=fd)       │
 │                                                              │
 │   [user-defined services via mount + exec + vsock]           │
 └──────────────────────────────────────────────────────────────┘
@@ -53,7 +53,7 @@ Sub-modules:
 |---|---|
 | **vm-manager** | Create / start / stop / destroy the VM. On Windows, calls the HCS (Host Compute Service) API directly via `computecore.dll` to create a LCOW utility VM with direct kernel boot. On macOS, uses Apple Virtualization.framework. Manages the VM lifecycle and vsock connections. |
 | **netstack-svc** | Receives raw Ethernet frames from the guest TAP tunnel over vsock. Runs a full userspace TCP/IP stack using gVisor's `tcpip` and `stack` packages. For each outbound connection, performs a regular host-side `connect()` syscall, so the traffic inherits the host's network identity, DNS resolution, proxy settings, and TLS trust store. |
-| **mount-broker** | Exposes host directories into the guest via virtiofs (preferred) or 9p. Tracks which host paths are shared and their corresponding guest mount points, so that `Environment` and `Sandbox`-level mount requests can reference them. |
+| **fileshare** | In-process 9P2000.L server on vsock port 1002. Every SDK mount — sandbox-level (reserved aname `@vm`) and env-level — rides this server. Optional **File Guard** store (opt-in per env) hooks mutating ops to back up pre-mutation content and expose `list/restore/status/clear` to the SDK. See [file-guard.md](file-guard.md). |
 
 #### as-guestd (Go, runs in guest)
 
@@ -66,7 +66,7 @@ Sub-modules:
 | **tap-bridge** | Creates a TAP device, sets it as the guest's default route, and tunnels all frames over a dedicated vsock connection to the host netstack-svc. The guest kernel sees a normal network interface; no special configuration required. |
 | **env-manager** | Handles `environment.create` RPCs: creates a temporary user, sets up a bwrap invocation with mount/pid/ipc namespace isolation, applies optional cgroup limits (cpu, memory). On `environment.close`: kills all processes, unmounts, deletes the user, cleans temp files. |
 | **exec-runner** | Handles `exec` RPCs: spawns processes at either the VM level (as `sandbox-admin`) or inside a given environment's bwrap namespace (as that environment's user). Streams stdout/stderr back over the control vsock connection. Supports stdin forwarding, signals, and timeout. |
-| **mount-mounter** | Mounts virtiofs/9p shares (exposed by the host mount-broker) at staging paths inside the VM, then binds them into the bwrap mount namespace for the target environment. For VM-level mounts, places them directly at the requested guest path. |
+| **fileshare** | Handles `file_share.mount`: opens a raw `AF_VSOCK` socket to the host's 9P server on port 1002, writes the aname frame, and `syscall.Mount`s the fd with `trans=fd`. For VM-level mounts, places them directly at the requested guest path; env-level mounts are bound into the bwrap mount namespace by env-manager. |
 
 ## Data Paths
 
@@ -151,6 +151,7 @@ class Sandbox:
         cwd: str = "/",
         cpu_limit: str | None = None,     # e.g. "2" (cores)
         mem_limit: str | None = None,     # e.g. "4G"
+        file_guard: bool = False,         # see file-guard.md
     ) -> Environment: ...
 
     @property
@@ -179,8 +180,20 @@ class Environment:
     async def export(self, guest_path: str, host_path: str) -> None: ...
     async def close(self) -> None: ...
 
+    @property
+    def file_guard(self) -> FileGuard: ...   # when env was created with file_guard=True
+
     async def __aenter__(self) -> Environment: ...
     async def __aexit__(self, *exc) -> None: ...
+
+
+# --- FileGuard (see file-guard.md) ---
+
+class FileGuard:
+    async def list(self) -> list[FileGuardEntry]: ...
+    async def restore(self, path: str) -> None: ...     # raises NoBackupError
+    async def status(self) -> FileGuardStatus: ...
+    async def clear(self) -> None: ...
 
 
 # --- Process ---
@@ -281,7 +294,15 @@ Image build tooling (shell script + Dockerfile) lives in `images/`.
 
 ## vsock Protocol
 
-The system uses multiple vsock connections between as-hostd and as-guestd. Port 1000 and 1001 are reserved for the control and data channels. Additional ports can be requested by the user for custom services.
+The system uses multiple vsock connections between as-hostd and as-guestd.
+Ports 1000, 1001, and 1002 are reserved; additional ports can be
+requested by the user for custom services.
+
+- **1000** — control channel (JSON-RPC 2.0)
+- **1001** — network data channel (raw Ethernet frames)
+- **1002** — 9P file-share (9P2000.L over raw byte stream; see
+  [file-guard.md](file-guard.md))
+- **2000+** — user-defined
 
 ### Control Channel (CID=3, port 1000)
 
@@ -302,8 +323,10 @@ Methods exposed by as-guestd:
 | `exec.write` | `{pid, data_b64}` | Write to stdin |
 | `exec.close_stdin` | `{pid}` | Close stdin |
 | `exec.kill` | `{pid, signal}` | Send signal |
-| `mount.bind` | `{virtiofs_tag, guest_path}` | Mount a virtiofs share |
-| `mount.unbind` | `{guest_path}` | Unmount |
+| `file_share.mount` | `{env_name, guest_path, vsock_port}` | Dial the host's 9P server, write the aname frame, and `mount(2)` the fd at `guest_path`. Primary mount path — used by both sandbox-level (`env_name="@vm"`) and env-level mounts. |
+| `file_share.unmount` | `{guest_path}` | `umount(2)` the path. The host-side session dies on its own when the vsock closes. |
+| `mount.bind` | `{virtiofs_tag, guest_path}` | **Legacy** — virtiofs/Plan9 bind. No longer in the primary mount path but kept for fallback. |
+| `mount.unbind` | `{guest_path}` | Legacy unmount for `mount.bind`. |
 | `log.subscribe` | `{min_level}` | Enable log forwarding at or above `min_level` |
 
 Notifications from as-guestd to as-hostd (JSON-RPC notifications, no response expected):
@@ -336,13 +359,13 @@ Ports requested via `vsock_ports` in `Sandbox.create()` are available for user-d
 
 - VM management: directly calls the Host Compute Service (HCS) API via `computecore.dll`. Creates a LCOW (Linux Containers on Windows) utility VM with direct kernel boot (vmlinuz + initramfs + rootfs VHDX).
 - vsock: Hyper-V sockets (`hvsocket`) via `go-winio`. Uses `AF_HYPERV` with the VM's runtime GUID and a service GUID derived from the port number.
-- File sharing: Plan 9 shares via HCS modify requests.
+- File sharing: self-hosted 9P2000.L server on vsock port 1002. HCS Plan 9 is still enabled in the device list but unused in the primary path.
 
 ### AVF (macOS)
 
 - VM management: Apple Virtualization.framework via cgo or a Swift helper.
 - vsock: Standard virtio-vsock, `SOCK_STREAM` over `/dev/vsock`.
-- virtiofs: Natively supported by AVF via `VZVirtioFileSystemDeviceConfiguration`.
+- File sharing: same self-hosted 9P2000.L server on vsock port 1002 as on Windows; no AVF-specific file-share device is needed.
 
 The platform boundary is a Go interface:
 
@@ -374,13 +397,16 @@ agent-sandbox/
 │   ├── vm/                      # VMBackend interface + implementations
 │   │   └── hcs/                 # Windows HCS (macOS AVF: TODO)
 │   ├── netstack/                # gVisor netstack integration
+│   ├── fileshare/               # 9P server + per-conn attacher + aname routing
+│   ├── fileguard/               # per-env backup store (list/restore/status/clear)
 │   └── rpc/                     # JSON-RPC framing + stdio server
 ├── as-guestd/                   # Go module: guest-side daemon
 │   ├── cmd/as-guestd/
 │   ├── tap/                     # TAP device + vsock tunnel
 │   ├── env/                     # useradd / bwrap / cgroup manager
 │   ├── exec/                    # process runner, stdio streaming
-│   ├── mount/                   # virtiofs / 9p bind helper
+│   ├── fileshare/               # AF_VSOCK dial + syscall.Mount trans=fd
+│   ├── mount/                   # legacy virtiofs/9p bind helper
 │   ├── log/                     # structured logger
 │   └── rpc/                     # JSON-RPC framing
 ├── sdk/                         # Python SDK
@@ -388,6 +414,7 @@ agent-sandbox/
 │       ├── __init__.py
 │       ├── sandbox.py           # Sandbox class
 │       ├── environment.py       # Environment class
+│       ├── file_guard.py        # FileGuard / FileGuardEntry / NoBackupError
 │       ├── process.py           # Process class
 │       ├── network.py           # port forwarding / expose
 │       ├── _rpc.py              # JSON-RPC over stdio
