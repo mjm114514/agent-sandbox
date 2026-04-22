@@ -1,21 +1,76 @@
 # Agent Sandbox
 
-Local VM-based sandbox for AI agents with transparent host networking.
+A local sandbox built for running AI agents on your own machine —
+**you control what the agent can reach**, and **you can see what it
+did**.
 
-All network traffic from the VM is re-originated by the host process, so it inherits the host's DNS, proxy settings, TLS trust store, and network identity — no VM enrollment required in enterprise environments.
+When an agent operates on your machine, two things have to be true:
+you bound its access to a known set of files and network paths, and
+you can audit every file mutation and every outbound connection after
+the fact (and undo mistakes). Agent Sandbox is built around those
+two properties.
 
-For architecture and design rationale, see [docs/design.md](docs/design.md).
+For architecture and design rationale, see
+[docs/design.md](docs/design.md).
 
-## Features
+## Scoped access
 
-- **One-VM-per-app model.** A single long-lived VM hosts many cheap, disposable agent workspaces.
-- **Transparent networking.** Guest traffic exits through the host's network stack — DNS, proxy, TLS trust all inherited automatically.
-- **Fast environments.** Per-agent isolation via `useradd` + bubblewrap + cgroups; no VM reboot between tasks.
-- **Mount host directories** into the VM or into a specific environment, read-only or read-write. All mounts ride a self-hosted 9P server on vsock — no hypervisor-specific file-share device required.
-- **File Guard** (opt-in per env): the 9P server backs up any mounted file on first modification and exposes `list` / `restore` / `status` / `clear` through the SDK. See [docs/file-guard.md](docs/file-guard.md).
-- **Streaming process I/O** for stdout, stderr, stdin, signals, and exit codes.
-- **Vsock ports** for direct host↔guest communication to build custom services (proxies, credential brokers, etc.).
-- **Python SDK** with `asyncio` API; Go host daemon (`as-hostd`) + in-guest daemon (`as-guestd`).
+- **Filesystem.** The agent only sees directories you explicitly pass
+  via `Mount(...)`. Everything else lives inside the VM's ephemeral
+  rootfs — no access to your home dir, your configs, or anything else
+  on the host. Mounts are `ro` or `rw`, per-caller. Multiple
+  environments in the same VM can't see each other's scratch space
+  (each is a separate Linux user inside a bubblewrap mount/PID/IPC
+  namespace).
+- **Network.** The guest has no direct NIC. All frames tunnel over
+  vsock to a userspace gVisor netstack on the host, which
+  re-originates each outbound connection as a regular `connect()`
+  syscall from the host `as-hostd` process. The agent inherits your
+  host's DNS, proxy, and TLS trust — *and any firewall, deny rules,
+  or traffic-inspection tooling you already have*.
+- **Compute.** Per-environment `cpu_limit` / `mem_limit` via cgroups.
+  The VM itself is capped at the `vcpus`/`mem` you set on
+  `Sandbox.create`.
+- **Lifetime.** Environments are ephemeral — `useradd` + bwrap; torn
+  down at `close()` or when the VM stops. No leftover state unless
+  you wrote to a mount.
+
+## Auditable operations
+
+- **File changes.** Pass `file_guard=True` on an environment and the
+  host-side 9P server snapshots the pre-mutation content of every
+  file the agent touches under a mount. After the task:
+  `env.file_guard.list()` returns a change list with state
+  (`modified` / `deleted` / `reverted`); `env.file_guard.restore(path)`
+  rolls back individual files. See
+  [docs/file-guard.md](docs/file-guard.md).
+- **Network.** Every outbound connection is a plain syscall from the
+  `as-hostd` process. Host packet captures, firewalls, proxies, and
+  SIEM tooling see agent traffic the same way they see any host
+  process — you can attribute, log, or block it with tools you
+  already run.
+- **Processes.** Every `exec(...)` streams stdout/stderr back over
+  RPC, so the caller sees exactly what ran. The guest daemon also
+  writes a structured log retrievable via `sb.export_logs()`.
+
+## How it works
+
+One long-lived VM per application hosts many cheap **environments**.
+Each environment is a Linux user plus a bubblewrap namespace — cheap
+enough to spin one up per agent task. Two daemons coordinate:
+`as-hostd` on the host and `as-guestd` in the guest, talking
+JSON-RPC 2.0 over a vsock control channel.
+
+Three dedicated data paths handle the bounded+auditable surfaces:
+
+| Concern | Host side | Guest side |
+|---|---|---|
+| **Files** | In-process 9P2000.L server (`hugelgupf/p9`) on vsock :1002. File Guard hook runs on every mutating op (`Twrite`, `Tunlinkat`, `TrenameAt`, size-changing `Tsetattr`, `Topen O_TRUNC`) to back up pre-mutation content. | `mount(2) -t 9p -o trans=fd` using a raw `AF_VSOCK` socket to the host. |
+| **Network** | gVisor netstack terminates guest-side TCP and opens a fresh host-side `connect()` per connection. | TAP device as the default route; all Ethernet frames tunnel over vsock. |
+| **Processes** | Exec-runner RPC streaming stdout/stderr as notifications. | Spawn as env user, inside bwrap. |
+
+Platform: Hyper-V Compute Service on Windows today. Apple
+Virtualization.framework (macOS) is designed but not yet implemented.
 
 ## Quick Start
 
@@ -27,19 +82,20 @@ async def main():
     sb = await Sandbox.create(vcpus=2, mem="4G")
     await sb.start()
 
-    # Run a service at the VM level
-    await sb.exec(["/opt/tools/my-service", "--port=8080"])
-
-    # Create an isolated environment for an agent task
     async with await sb.environment(
         name="task-1",
         mounts=[Mount("./my-project", "/work")],
         cwd="/work",
+        file_guard=True,
     ) as env:
         proc = await env.exec(["python", "run.py"])
         async for chunk in proc.stdout_stream():
             print(chunk.decode(), end="")
-        exit_code = await proc.wait()
+        await proc.wait()
+
+        # See what the task touched; roll back anything you didn't want.
+        for entry in await env.file_guard.list():
+            print(entry.current_state, entry.path)
 
     await sb.destroy()
 
@@ -50,13 +106,13 @@ asyncio.run(main())
 
 - **Windows**: Hyper-V enabled, admin privileges
 - **macOS**: Apple Silicon (AVF support) — *not yet implemented*
-- **Go 1.26+** (for building as-hostd and as-guestd)
+- **Go 1.26+** (for building `as-hostd` and `as-guestd`)
 - **Python 3.12+** (for the SDK)
 - **WSL2 with Ubuntu** (for building the VM image on Windows)
 
 ## Building
 
-### 1. Build as-hostd
+### 1. Build `as-hostd`
 
 ```bash
 cd as-hostd
@@ -65,15 +121,16 @@ go build -o as-hostd.exe ./cmd/as-hostd/   # Windows
 
 ### 2. Build the VM image
 
-The VM boots off two disks:
+The VM boots off two disks so iterating on `as-guestd` doesn't require
+rebuilding the base image every time:
 
-- **`rootfs.vhdx`** — stable base image (Alpine + deps + a bootstrap init
+- **`rootfs.vhdx`** — stable base (Alpine + deps + a bootstrap init
   script). Rebuilt only when OS deps change.
 - **`as-guestpack.vhdx`** — small read-only ext4 carrying the current
   `as-guestd` binary (and any other guest-side tooling). Rebuilt on
-  every guestd iteration (≈5s).
+  every guestd iteration (~5s).
 
-Requires WSL2 with `qemu-utils` and `e2fsprogs` installed.
+Requires WSL2 with `qemu-utils` and `e2fsprogs`.
 
 **One-time base image build** (slow, needs sudo):
 
@@ -112,7 +169,8 @@ await sb.start()
 
 ### Environment
 
-An isolated workspace inside the VM. Each environment gets its own Linux user, mount namespace, and optional cgroup limits.
+An isolated workspace inside the VM. Each environment gets its own
+Linux user, mount namespace, and optional cgroup limits.
 
 ```python
 async with await sb.environment(
@@ -128,9 +186,8 @@ async with await sb.environment(
 
 ### File Guard
 
-Pass `file_guard=True` to snapshot-on-first-modification any file the
-agent touches under a mount. Review and selectively roll back after the
-task:
+Snapshot-on-first-modification for anything the agent touches under a
+mount. Review the change list and selectively roll back:
 
 ```python
 async with await sb.environment(
@@ -147,8 +204,8 @@ async with await sb.environment(
     await env.file_guard.restore("/work/src/important.py")
 ```
 
-See [docs/file-guard.md](docs/file-guard.md) for the backup layout,
-caps, and recovery semantics.
+See [docs/file-guard.md](docs/file-guard.md) for backup layout, caps,
+and recovery semantics.
 
 ### Process
 
@@ -192,15 +249,17 @@ agent-sandbox/
 
 ## Status
 
-Working end-to-end on Windows (HCS backend). The following is verified:
+Working end-to-end on Windows (HCS backend). Verified:
 
 - VM creation and direct kernel boot via HCS
-- as-guestd ↔ as-hostd communication over Hyper-V sockets
+- `as-guestd` ↔ `as-hostd` over Hyper-V sockets
 - Process execution at both VM and environment level
 - Environment isolation (per-user + bwrap namespaces)
 - Network forwarding through gVisor netstack
+- 9P file-share over vsock with File Guard end-to-end
 
 ## Documentation
 
 - [docs/design.md](docs/design.md) — architecture, components, design principles
+- [docs/file-guard.md](docs/file-guard.md) — 9P server + File Guard details
 - [docs/error-recovery.md](docs/error-recovery.md) — heartbeat, failure detection, logging
