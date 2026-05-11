@@ -69,8 +69,11 @@ Three dedicated data paths handle the bounded+auditable surfaces:
 | **Network** | gVisor netstack terminates guest-side TCP and opens a fresh host-side `connect()` per connection. | TAP device as the default route; all Ethernet frames tunnel over vsock. |
 | **Processes** | Exec-runner RPC streaming stdout/stderr as notifications. | Spawn as env user, inside bwrap. |
 
-Platform: Hyper-V Compute Service on Windows today. Apple
-Virtualization.framework (macOS) is designed but not yet implemented.
+Platform: Hyper-V Compute Service on Windows. An Apple
+Virtualization.framework backend for macOS is implemented (cgo +
+Objective-C bridge); end-to-end testing on Apple Silicon is in progress
+and the image build pipeline still needs a raw-`.img` target for the
+rootfs / guestpack disks.
 
 ## Quick Start
 

@@ -18,4 +18,4 @@
 
 ## P3
 
-- [ ] **macOS AVF backend** — Implement `vm/avf` using Apple Virtualization.framework. Design doc is ready; no code written.
+- [x] **macOS AVF backend** — `vm/avf` implements the VMBackend interface using Apple Virtualization.framework (cgo + Objective-C bridge). VM lifecycle, virtio-vsock listener, and disk attach are wired; needs end-to-end testing on Apple Silicon and an image build target that emits raw `.img` rootfs/guestpack.

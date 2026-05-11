@@ -19,6 +19,7 @@ import (
 	"github.com/anthropics/agent-sandbox/as-hostd/netstack"
 	"github.com/anthropics/agent-sandbox/as-hostd/rpc"
 	"github.com/anthropics/agent-sandbox/as-hostd/vm"
+	"github.com/anthropics/agent-sandbox/as-hostd/vm/avf"
 	"github.com/anthropics/agent-sandbox/as-hostd/vm/hcs"
 )
 
@@ -99,11 +100,27 @@ func (d *daemon) detectBackend() {
 	if bootDir == "" {
 		bootDir = filepath.Join(filepath.Dir(os.Args[0]), "boot")
 	}
-	b := hcs.New(bootDir)
-	if b.Available() {
-		d.backend = b
-		log.Printf("using HCS backend, boot dir: %s", bootDir)
-		return
+	// AS_HOSTD_BACKEND pins the backend to "hyperv" or "avf" for testing /
+	// dev. Empty string falls through to first-available probing, ordered
+	// hyperv → avf (each backend's Available() returns false on the wrong OS,
+	// so order doesn't matter in practice).
+	want := os.Getenv("AS_HOSTD_BACKEND")
+	candidates := []struct {
+		name string
+		b    vm.Backend
+	}{
+		{"hyperv", hcs.New(bootDir)},
+		{"avf", avf.New(bootDir)},
+	}
+	for _, c := range candidates {
+		if want != "" && want != c.name {
+			continue
+		}
+		if c.b.Available() {
+			d.backend = c.b
+			log.Printf("using %s backend, boot dir: %s", c.name, bootDir)
+			return
+		}
 	}
 	log.Println("no VM backend available")
 }
