@@ -5,7 +5,9 @@
 #import "bridge_darwin.h"
 
 API_AVAILABLE(macos(12.0))
-@interface AVFListener : NSObject <VZVirtioSocketListenerDelegate>
+@interface AVFListener : NSObject <VZVirtioSocketListenerDelegate> {
+    int _acceptInflight; // protected by _cond
+}
 @property (nonatomic, strong) NSMutableArray<NSNumber *> *pendingFDs;
 @property (nonatomic, strong) NSCondition *cond;
 @property (nonatomic, assign) BOOL closed;
@@ -22,6 +24,7 @@ API_AVAILABLE(macos(12.0))
         _pendingFDs = [NSMutableArray array];
         _cond = [[NSCondition alloc] init];
         _closed = NO;
+        _acceptInflight = 0;
     }
     return self;
 }
@@ -49,6 +52,7 @@ API_AVAILABLE(macos(12.0))
 
 - (int)acceptBlocking {
     [_cond lock];
+    _acceptInflight++;
     while (_pendingFDs.count == 0 && !_closed) {
         [_cond wait];
     }
@@ -57,6 +61,9 @@ API_AVAILABLE(macos(12.0))
         fd = [_pendingFDs.firstObject intValue];
         [_pendingFDs removeObjectAtIndex:0];
     }
+    _acceptInflight--;
+    // Wake closeListener if it's parked on the drain loop.
+    [_cond broadcast];
     [_cond unlock];
     return fd;
 }
@@ -69,6 +76,12 @@ API_AVAILABLE(macos(12.0))
     }
     [_pendingFDs removeAllObjects];
     [_cond broadcast];
+    // Wait for every in-flight acceptBlocking to leave the method. Without
+    // this drain, an Accept goroutine can be mid-unwind on `self` after the
+    // cgo handle has been released and the owning dict has dropped its ref.
+    while (_acceptInflight > 0) {
+        [_cond wait];
+    }
     [_cond unlock];
 }
 @end
@@ -242,32 +255,32 @@ avf_listener_t avf_vm_listen(avf_vm_t handle, uint32_t port, char **err_out) {
     if (@available(macOS 12.0, *)) {
         AVFVM *wrapper = (__bridge AVFVM *)handle;
 
-        // VZVirtualMachine state must be touched on the VM queue.
-        __block VZVirtioSocketDevice *dev = nil;
-        dispatch_sync(wrapper.queue, ^{
-            if (wrapper.vm.socketDevices.count > 0) {
-                dev = (VZVirtioSocketDevice *)wrapper.vm.socketDevices.firstObject;
-            }
-        });
-        if (!dev) {
-            if (err_out) *err_out = strdup("VM has no virtio-socket device");
-            return NULL;
-        }
-
         AVFListener *l = [[AVFListener alloc] init];
         VZVirtioSocketListener *vzl = [[VZVirtioSocketListener alloc] init];
         vzl.delegate = l;
 
+        // socketDevices and setSocketListener:forPort: both require the VM's
+        // queue. Fold the lookup + register into one queue hop.
+        __block BOOL ok = NO;
         dispatch_sync(wrapper.queue, ^{
+            if (wrapper.vm.socketDevices.count == 0) return;
+            VZVirtioSocketDevice *dev = (VZVirtioSocketDevice *)wrapper.vm.socketDevices.firstObject;
             [dev setSocketListener:vzl forPort:port];
+            ok = YES;
         });
+        if (!ok) {
+            if (err_out) *err_out = strdup("VM has no virtio-socket device");
+            return NULL;
+        }
 
         @synchronized (wrapper) {
             wrapper.listeners[@(port)] = l;
             wrapper.vzListeners[@(port)] = vzl;
         }
-        // Unretained handle: lifetime is bound to wrapper.listeners.
-        return (__bridge void *)l;
+        // Retained handle — balanced by __bridge_transfer in
+        // avf_listener_close. The owning VM also retains via the dicts above,
+        // so the listener survives Close → in-flight Accept unwind.
+        return (__bridge_retained void *)l;
     }
     if (err_out) *err_out = strdup("macOS 12+ required");
     return NULL;
@@ -285,8 +298,32 @@ int avf_listener_accept(avf_listener_t handle) {
 void avf_listener_close(avf_listener_t handle) {
     if (@available(macOS 12.0, *)) {
         if (!handle) return;
-        AVFListener *l = (__bridge AVFListener *)handle;
+        // __bridge_transfer drops the cgo retain handed back by
+        // avf_vm_listen. closeListener drains in-flight accepts before
+        // returning, so by the time `l` goes out of scope no goroutine is
+        // still touching this object.
+        AVFListener *l = (__bridge_transfer AVFListener *)handle;
         [l closeListener];
+    }
+}
+
+void avf_vm_unlisten(avf_vm_t handle, uint32_t port) {
+    if (@available(macOS 12.0, *)) {
+        if (!handle) return;
+        AVFVM *wrapper = (__bridge AVFVM *)handle;
+        AVFListener *l = nil;
+        @synchronized (wrapper) {
+            l = wrapper.listeners[@(port)];
+            [wrapper.listeners removeObjectForKey:@(port)];
+            [wrapper.vzListeners removeObjectForKey:@(port)];
+        }
+        dispatch_sync(wrapper.queue, ^{
+            if (wrapper.vm.socketDevices.count > 0) {
+                VZVirtioSocketDevice *dev = (VZVirtioSocketDevice *)wrapper.vm.socketDevices.firstObject;
+                [dev removeSocketListenerForPort:port];
+            }
+        });
+        if (l) [l closeListener];
     }
 }
 

@@ -40,10 +40,15 @@ avf_listener_t avf_vm_listen(avf_vm_t vm, uint32_t port, char **err_out);
 // descriptor (caller closes). Returns -1 once the listener is closed.
 int avf_listener_accept(avf_listener_t lis);
 
-// Close the listener: wake any pending accept() with -1. The underlying
-// listener object is retained by the VM, so the handle stays valid for
-// idempotent closes until the VM itself is destroyed.
+// Close the listener: wake any pending accept() with -1, drain any
+// in-flight accept calls, and release the cgo-side strong ref handed back
+// by avf_vm_listen. After this returns the handle is invalid.
 void avf_listener_close(avf_listener_t lis);
+
+// Remove the framework's listener registration for `port` and release the
+// owning VM's strong reference. Used when re-VSockListen-ing a port whose
+// prior listener has been closed.
+void avf_vm_unlisten(avf_vm_t vm, uint32_t port);
 
 void avf_free_str(char *s);
 

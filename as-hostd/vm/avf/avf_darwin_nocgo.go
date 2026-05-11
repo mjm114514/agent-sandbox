@@ -4,6 +4,7 @@ package avf
 
 import (
 	"fmt"
+	"log"
 
 	vmapi "github.com/anthropics/agent-sandbox/as-hostd/vm"
 )
@@ -13,6 +14,7 @@ type Backend struct {
 }
 
 func New(bootDir string) *Backend {
+	log.Println("avf backend disabled: as-hostd was built with CGO_ENABLED=0; rebuild with CGO_ENABLED=1 to talk to Virtualization.framework")
 	return &Backend{BootDir: bootDir}
 }
 

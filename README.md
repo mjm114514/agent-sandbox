@@ -69,11 +69,11 @@ Three dedicated data paths handle the bounded+auditable surfaces:
 | **Network** | gVisor netstack terminates guest-side TCP and opens a fresh host-side `connect()` per connection. | TAP device as the default route; all Ethernet frames tunnel over vsock. |
 | **Processes** | Exec-runner RPC streaming stdout/stderr as notifications. | Spawn as env user, inside bwrap. |
 
-Platform: Hyper-V Compute Service on Windows. An Apple
-Virtualization.framework backend for macOS is implemented (cgo +
-Objective-C bridge); end-to-end testing on Apple Silicon is in progress
-and the image build pipeline still needs a raw-`.img` target for the
-rootfs / guestpack disks.
+Platform: Hyper-V Compute Service on Windows and Apple
+Virtualization.framework on macOS (Apple Silicon, macOS 12+). The AVF
+backend lives in `as-hostd/vm/avf/` (cgo + Objective-C bridge); raw
+`.img` rootfs / guestpack images are produced by `images/build-mac.sh`
+and `images/build-guestpack-mac.sh`.
 
 ## Quick Start
 
@@ -120,6 +120,7 @@ asyncio.run(main())
 ```bash
 cd as-hostd
 go build -o as-hostd.exe ./cmd/as-hostd/   # Windows
+CGO_ENABLED=1 go build -o as-hostd ./cmd/as-hostd/   # macOS (AVF needs cgo)
 ```
 
 ### 2. Build the VM image
@@ -127,30 +128,33 @@ go build -o as-hostd.exe ./cmd/as-hostd/   # Windows
 The VM boots off two disks so iterating on `as-guestd` doesn't require
 rebuilding the base image every time:
 
-- **`rootfs.vhdx`** — stable base (Alpine + deps + a bootstrap init
-  script). Rebuilt only when OS deps change.
-- **`as-guestpack.vhdx`** — small read-only ext4 carrying the current
+- **rootfs** — stable base (Alpine + deps + a bootstrap init script).
+  Rebuilt only when OS deps change. Windows: `rootfs.vhdx`. macOS:
+  `rootfs.img` (raw; Virtualization.framework doesn't read VHDX).
+- **as-guestpack** — small read-only ext4 carrying the current
   `as-guestd` binary (and any other guest-side tooling). Rebuilt on
-  every guestd iteration (~5s).
+  every guestd iteration (~5s). Windows: `as-guestpack.vhdx`. macOS:
+  `as-guestpack.img`.
 
-Requires WSL2 with `qemu-utils` and `e2fsprogs`.
-
-**One-time base image build** (slow, needs sudo):
-
-```bash
-wsl -e sudo bash images/build-wsl.sh
-```
-
-Produces `as-hostd/boot/{vmlinuz, initramfs, rootfs.vhdx}`.
-
-**Iterative guestpack build** (fast, no sudo):
+**Windows (HCS).** Requires WSL2 with `qemu-utils` and `e2fsprogs`.
 
 ```bash
-wsl -e bash images/build-guestpack-wsl.sh
+wsl -e sudo bash images/build-wsl.sh           # base, slow, needs sudo
+wsl -e bash images/build-guestpack-wsl.sh      # iterative, ~5s, no sudo
 ```
 
-Produces `as-hostd/boot/as-guestpack.vhdx`. Run this after any change
-to `as-guestd/**/*.go`; no need to touch the base rootfs.
+Produces `as-hostd/boot/{vmlinuz, initramfs, rootfs.vhdx, as-guestpack.vhdx}`.
+
+**macOS (AVF).** Requires Apple Silicon and Docker Desktop / Colima /
+OrbStack. Both scripts build inside `linux/arm64` containers; no chroot
+or sudo on the host.
+
+```bash
+bash images/build-mac.sh             # base image (Alpine arm64)
+bash images/build-guestpack-mac.sh   # iterative; needs Go on host
+```
+
+Produces `as-hostd/boot/{vmlinuz, initramfs, rootfs.img, as-guestpack.img}`.
 
 ### 3. Install the SDK
 
