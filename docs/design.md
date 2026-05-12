@@ -395,7 +395,8 @@ agent-sandbox/
 ├── as-hostd/                    # Go module: host-side daemon
 │   ├── cmd/as-hostd/            # main entry point
 │   ├── vm/                      # VMBackend interface + implementations
-│   │   └── hcs/                 # Windows HCS (macOS AVF: TODO)
+│   │   ├── hcs/                 # Windows HCS
+│   │   └── avf/                 # macOS Apple Virtualization.framework (cgo + ObjC)
 │   ├── netstack/                # gVisor netstack integration
 │   ├── fileshare/               # 9P server + per-conn attacher + aname routing
 │   ├── fileguard/               # per-env backup store (list/restore/status/clear)
